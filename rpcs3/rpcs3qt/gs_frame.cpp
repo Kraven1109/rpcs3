@@ -102,15 +102,12 @@ gs_frame::gs_frame(QScreen* screen, const QRect& geometry, const QIcon& appIcon,
 	// NOTE: You cannot safely create a wayland window that has hidden initial status and perform any changes on the window while it is still hidden.
 	// Doing this will create a surface with deferred commands that require a buffer. When binding to your session, this may assert in your compositor due to protocol restrictions.
 #ifndef _WIN32
-	if (const char* session_type = ::getenv("XDG_SESSION_TYPE"))
+	if (QApplication::platformName().startsWith("wayland", Qt::CaseInsensitive))
 	{
-		if (!strcasecmp(session_type, "wayland"))
-		{
-			// Start windowed. This is a featureless rectangle on-screen with no window decorations.
-			// It does not even resemble a window until the WM attaches later on.
-			// Fullscreen could technically work with some fiddling, but easily breaks depending on geometry input.
-			m_startup_visibility = Windowed;
-		}
+		// Start windowed. This is a featureless rectangle on-screen with no window decorations.
+		// It does not even resemble a window until the WM attaches later on.
+		// Fullscreen could technically work with some fiddling, but easily breaks depending on geometry input.
+		m_startup_visibility = Windowed;
 	}
 #endif
 

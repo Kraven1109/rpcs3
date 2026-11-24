@@ -587,17 +587,32 @@ namespace vk
 		}
 	}
 
+#if defined(ARCH_X64)
+#if defined(_MSC_VER)
+#define vk_waitpkg_func
+#else
+#define vk_waitpkg_func __attribute__((__target__("waitpkg")))
+#endif
+	vk_waitpkg_func static void vk_tpause_c02(u64 deadline) noexcept
+	{
+		_tpause(0x0, deadline);
+	}
+#undef vk_waitpkg_func
+#endif
+
 	VkResult wait_for_event(event* pEvent, u64 timeout)
 	{
 		// Convert timeout to TSC cycles. Timeout accuracy isn't super-important, only fast response when event is signaled (within 10us if possible)
 		const u64 freq = utils::get_tsc_freq();
+		const u64 cycles_per_us = freq / 1'000'000;
 
 		if (freq)
 		{
-			timeout *= (freq / 1'000'000);
+			timeout *= cycles_per_us;
 		}
 
 		u64 start = 0;
+		u32 spin_count = 0;
 
 		while (true)
 		{
@@ -612,9 +627,10 @@ namespace vk
 				return status;
 			}
 
+			u64 now = 0;
 			if (timeout)
 			{
-				const auto now = freq ? utils::get_tsc() : get_system_time();
+				now = freq ? utils::get_tsc() : get_system_time();
 
 				if (!start)
 				{
@@ -630,7 +646,24 @@ namespace vk
 				}
 			}
 
-			utils::pause();
+#if defined(ARCH_X64)
+			static const bool s_has_waitpkg = utils::has_waitpkg();
+			if (s_has_waitpkg && cycles_per_us && spin_count >= 32)
+			{
+				const u64 base_tsc = (timeout && freq) ? now : utils::get_tsc();
+				const u64 step_us = (spin_count < 64) ? 2ull : 5ull;
+				vk_tpause_c02(base_tsc + step_us * cycles_per_us);
+			}
+			else
+#endif
+			{
+				utils::pause();
+			}
+
+			if (spin_count < 64)
+			{
+				++spin_count;
+			}
 		}
 	}
 }
