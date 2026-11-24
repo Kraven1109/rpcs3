@@ -196,6 +196,7 @@ namespace rsx
 			void read(register_pair& data);
 			inline bool read_unsafe(register_pair& data);
 			bool skip_methods(u32 count);
+			void wait_idle(u32 cycles) const;
 		};
 	}
 }

@@ -963,20 +963,21 @@ namespace rsx
 				const auto page_address = utils::page_start(static_cast<u32>(address));
 				std::scoped_lock lock(m_pages_mutex);
 
-				if (auto found = m_locked_pages[location].find(page_address);
-					found != m_locked_pages[location].end())
+				if (!m_pages_accessed[location])
 				{
-					auto& page = found->second;
+					if (auto found = m_locked_pages[location].find(page_address);
+						found != m_locked_pages[location].end())
+					{
+						auto& page = found->second;
 
-					ensure(page.has_refs());
-					page.release();
+						ensure(page.has_refs());
+						page.release();
+					}
+					return;
 				}
 			}
 
-			if (m_pages_accessed[location])
-			{
-				m_critical_reports_in_flight--;
-			}
+			m_critical_reports_in_flight--;
 		}
 
 		void ZCULL_control::disable_optimizations(::rsx::thread*, u32 location)
@@ -1034,7 +1035,6 @@ namespace rsx
 						{
 							// R/W to active block
 							need_disable_optimizations = true;    // Defer actual operation
-							m_pages_accessed[location] = true;
 						}
 						else
 						{
@@ -1054,9 +1054,11 @@ namespace rsx
 				auto thr = rsx::get_current_renderer();
 				rsx::eng_lock rlock(thr);
 				std::scoped_lock lock(m_pages_mutex);
-				disable_optimizations(thr, location);
-
-				thr->eng_interrupt_mask |= rsx::pipe_flush_interrupt;
+				if (!m_pages_accessed[location])
+				{
+					disable_optimizations(thr, location);
+					thr->eng_interrupt_mask |= rsx::pipe_flush_interrupt;
+				}
 				return true;
 			}
 

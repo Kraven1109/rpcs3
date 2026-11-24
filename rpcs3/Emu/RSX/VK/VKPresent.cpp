@@ -139,7 +139,8 @@ bool VKGSRender::reinitialize_swapchain()
 
 	// Flush the command buffer
 	close_and_submit_command_buffer(&resize_fence);
-	vk::wait_for_fence(&resize_fence);
+	// Block cleanly via vkWaitForFences during swapchain reinit instead of spinning vkGetFenceStatus
+	vk::wait_for_fence(&resize_fence, 2'000'000ull);
 
 	m_current_command_buffer->reset();
 	m_current_command_buffer->begin();
@@ -1020,6 +1021,26 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
 	}
 
 	queue_swap_request();
+
+	if (!info.emu_flip)
+	{
+		// Drain native-UI/loading frames (and XWayland presentation blit on present_queue) so
+		// asynchronous WM transitions cannot invalidate an in-flight swapchain buffer mid-GPU-draw.
+		while (!m_queued_frames.empty())
+		{
+			auto& frame = m_queued_frames.front();
+			if (!frame->swap_command_buffer)
+			{
+				m_queued_frames.pop_front();
+				continue;
+			}
+			frame_context_cleanup(frame);
+		}
+		if (const VkQueue present_queue = m_device->get_present_queue(); present_queue != VK_NULL_HANDLE)
+		{
+			vkQueueWaitIdle(present_queue);
+		}
+	}
 
 	m_ctx->stats.flip_time = m_profiler.duration();
 

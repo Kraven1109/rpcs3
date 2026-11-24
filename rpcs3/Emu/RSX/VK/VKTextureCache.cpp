@@ -457,12 +457,61 @@ namespace vk
 			}
 		};
 
+#ifndef RPCS3_DISABLE_ATLAS_WAW_AND_PRUNE_FIX
+		struct active_write_rect
+		{
+			u16 x1, y1, x2, y2, dst_z;
+			u8 level;
+		};
+		constexpr usz active_writes_stack_cap = 32;
+		std::array<active_write_rect, active_writes_stack_cap> active_writes_stack;
+		usz active_writes_count = 0;
+		rsx::simple_array<active_write_rect> active_writes_heap;
+		const bool track_overlaps = sections_to_transfer.size() > 1;
+
+		for (usz idx = 0; idx < sections_to_transfer.size(); ++idx)
+		{
+			const auto& section = sections_to_transfer[idx];
+			if (!section.src)
+			{
+				continue;
+			}
+
+			// Cull transfers completely overwritten by a later section in chronologic order
+			if (track_overlaps)
+			{
+				bool fully_occluded = false;
+				const u32 cur_x2 = u32{ section.dst_x } + section.dst_w;
+				const u32 cur_y2 = u32{ section.dst_y } + section.dst_h;
+				for (usz later = idx + 1; later < sections_to_transfer.size(); ++later)
+				{
+					const auto& next = sections_to_transfer[later];
+					if (next.src &&
+						next.level == section.level &&
+						next.dst_z == section.dst_z &&
+						next.dst_x <= section.dst_x &&
+						next.dst_y <= section.dst_y &&
+						(u32{ next.dst_x } + next.dst_w) >= cur_x2 &&
+						(u32{ next.dst_y } + next.dst_h) >= cur_y2)
+					{
+						fully_occluded = true;
+						break;
+					}
+				}
+
+				if (fully_occluded)
+				{
+					continue;
+				}
+			}
+#else
 		for (const auto& section : sections_to_transfer)
 		{
 			if (!section.src)
 			{
 				continue;
 			}
+#endif
 
 			const bool typeless = section.src->aspect() != dst_aspect ||
 				!formats_are_bitcast_compatible(dst, section.src);
@@ -498,6 +547,66 @@ namespace vk
 			{
 				surface->transform_samples_to_pixels(src_x, src_w, src_y, src_h);
 			}
+
+#ifndef RPCS3_DISABLE_ATLAS_WAW_AND_PRUNE_FIX
+			// Synchronize WAW hazards when an earlier transfer overlaps this destination rectangle
+			if (track_overlaps)
+			{
+				const u16 cur_x1 = section.dst_x;
+				const u16 cur_y1 = section.dst_y;
+				const u16 cur_x2 = static_cast<u16>(section.dst_x + section.dst_w);
+				const u16 cur_y2 = static_cast<u16>(section.dst_y + section.dst_h);
+				const active_write_rect* prev_data = active_writes_heap.empty() ? active_writes_stack.data() : active_writes_heap.data();
+				const usz prev_count = active_writes_heap.empty() ? active_writes_count : active_writes_heap.size();
+
+				for (usz pi = 0; pi < prev_count; ++pi)
+				{
+					const auto& prev = prev_data[pi];
+					if (prev.level == section.level &&
+						prev.dst_z == section.dst_z &&
+						cur_x1 < prev.x2 &&
+						prev.x1 < cur_x2 &&
+						cur_y1 < prev.y2 &&
+						prev.y1 < cur_y2)
+					{
+						const VkImageSubresourceRange waw_range = {
+							dst_aspect,
+							section.level, 1,
+							(dst->info.imageType == VK_IMAGE_TYPE_3D) ? 0u : section.dst_z, 1
+						};
+						vk::insert_image_memory_barrier(
+							cmd,
+							dst->handle(),
+							dst->current_layout, dst->current_layout,
+							VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+							VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+							waw_range);
+						active_writes_count = 0;
+						active_writes_heap.clear();
+						break;
+					}
+				}
+
+				const active_write_rect cur_rect{ cur_x1, cur_y1, cur_x2, cur_y2, section.dst_z, static_cast<u8>(section.level) };
+				if (!active_writes_heap.empty())
+				{
+					active_writes_heap.push_back(cur_rect);
+				}
+				else if (active_writes_count < active_writes_stack_cap)
+				{
+					active_writes_stack[active_writes_count++] = cur_rect;
+				}
+				else
+				{
+					active_writes_heap.reserve(sections_to_transfer.size());
+					for (usz si = 0; si < active_writes_count; ++si)
+					{
+						active_writes_heap.push_back(active_writes_stack[si]);
+					}
+					active_writes_heap.push_back(cur_rect);
+				}
+			}
+#endif
 
 			if (typeless) [[unlikely]]
 			{
@@ -1282,6 +1391,39 @@ namespace vk
 		auto p_subresource_layout = &subresource_layout;
 		u32 heap_align = upload_heap_align_default;
 
+#ifndef RPCS3_DISABLE_TILED_DETILE_READBACK_FIX
+		if (auto tiled_region = rsx::get_current_renderer()->get_tiled_memory_region(rsx_range);
+			(context == rsx::texture_upload_context::blit_engine_src || context == rsx::texture_upload_context::shader_read) && tiled_region)
+		{
+			if (mipmaps > 1 || subresource_layout.size() > 1)
+			{
+				// This really shouldn't happen on framebuffer tiled memory
+				rsx_log.error("Tiled decode of multi-subresource textures is not supported (mipmaps=%u, layers=%zu, type=%u).",
+					mipmaps, subresource_layout.size(), static_cast<u32>(type));
+			}
+			else
+			{
+				if (vk::is_renderpass_open(cmd))
+				{
+					vk::end_renderpass(cmd);
+				}
+
+				const auto bpp = rsx::get_format_block_size_in_bytes(gcm_format);
+				const auto [scratch_buf, linear_data_scratch_offset] = vk::detile_memory_block(cmd, tiled_region, rsx_range, width, height, bpp);
+
+				auto subres = subresource_layout.front();
+				// FIXME: !!EVIL!!
+				subres.data = { scratch_buf, linear_data_scratch_offset };
+				subres.pitch_in_block = width;
+				upload_command_flags |= source_is_gpu_resident;
+				upload_command_flags &= ~upload_contents_async;
+				heap_align = width * bpp;
+
+				tmp.push_back(std::move(subres));
+				p_subresource_layout = &tmp;
+			}
+		}
+#else
 		if (auto tiled_region = rsx::get_current_renderer()->get_tiled_memory_region(rsx_range);
 			context == rsx::texture_upload_context::blit_engine_src && tiled_region)
 		{
@@ -1306,6 +1448,7 @@ namespace vk
 				p_subresource_layout = &tmp;
 			}
 		}
+#endif
 
 		const u16 layer_count = (type == rsx::texture_dimension_extended::texture_dimension_cubemap) ? 6 : 1;
 		vk::upload_image(cmd, image, *p_subresource_layout, gcm_format, input_swizzled, layer_count, image->aspect(),
