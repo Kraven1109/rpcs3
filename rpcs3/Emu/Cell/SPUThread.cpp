@@ -5922,25 +5922,27 @@ s64 spu_thread::get_ch_value(u32 ch)
 				}
 			}
 
-			if (eventstat_busy_waiting_switch == 1)
+			const u64 time_since = eventstat_busy_waiting_switch == 1 ? (get_system_time() - eventstat_evaluate_time) : 0;
+
+			if (eventstat_busy_waiting_switch == 1 && !is_reservation_data_checking_thread && time_since >= (utils::get_thread_count() >= 9 ? 50'000 : 3000))
 			{
-				// Don't be stubborn, force operating sleep if too much time has passed
-				const u64 time_since = get_system_time() - eventstat_evaluate_time;
+				spu_log.trace("SPU RdEventStat wait for 0x%x failed", raddr);
+				history.front() = 2;
+				eventstat_busy_waiting_switch = 0;
+				continue;
+			}
 
-				if (!is_reservation_data_checking_thread && time_since >= (utils::get_thread_count() >= 9 ? 50'000 : 3000))
-				{
-					spu_log.trace("SPU RdEventStat wait for 0x%x failed", raddr);
-					history.front() = 2;
-					eventstat_busy_waiting_switch = 0;
-					continue;
-				}
-
+			if (eventstat_busy_waiting_switch == 1 && (is_reservation_data_checking_thread || time_since < 800))
+			{
 #if defined(ARCH_X64)
 				if (utils::has_um_wait())
 				{
 					if (utils::has_waitpkg())
 					{
-						__tpause(static_cast<u32>(std::min<u64>(eventstat_spin_count, 10) * 500), 0x1);
+						const u32 wait_cycles = (is_reservation_data_checking_thread && time_since >= 800)
+							? 90'000u
+							: static_cast<u32>(std::min<u64>(eventstat_spin_count, 10) * 500);
+						__tpause(wait_cycles, (is_reservation_data_checking_thread && time_since >= 800) ? 0x0 : 0x1);
 					}
 					else
 					{
@@ -6045,7 +6047,7 @@ s64 spu_thread::get_ch_value(u32 ch)
 						}
 						else if (check_cache_line_waiter())
 						{
-							utils::bless<atomic_t<u32>>(&wait_var->raw().wait_flag)->wait(flag_val, atomic_wait_timeout{50'000});
+							utils::bless<atomic_t<u32>>(&wait_var->raw().wait_flag)->wait(flag_val, atomic_wait_timeout{eventstat_busy_waiting_switch == 1 ? 250'000u : 50'000u});
 						}
 
 						vm::reservation_notifier_end_wait(*wait_var);

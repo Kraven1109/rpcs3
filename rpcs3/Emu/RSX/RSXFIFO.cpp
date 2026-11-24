@@ -10,6 +10,7 @@
 #include "NV47/HW/context.h"
 
 #include "util/asm.hpp"
+#include "util/sysinfo.hpp"
 
 #include <thread>
 
@@ -17,6 +18,33 @@ using spu_rdata_t = std::byte[128];
 
 extern void mov_rdata(spu_rdata_t& _dst, const spu_rdata_t& _src);
 extern bool cmp_rdata(const spu_rdata_t& _lhs, const spu_rdata_t& _rhs);
+
+#if defined(ARCH_X64)
+#if defined(_MSC_VER)
+#define rsx_fifo_waitpkg_func
+#else
+#define rsx_fifo_waitpkg_func __attribute__((__target__("waitpkg")))
+#endif
+
+rsx_fifo_waitpkg_func static void rsx_fifo_umwait_put(RsxDmaControl* ctrl, u32 expected, const rsx::atomic_bitmask_t<rsx::eng_interrupt_reason>& intr, u32 cycles) noexcept
+{
+	_umonitor(const_cast<void*>(static_cast<const volatile void*>(&ctrl->put.raw())));
+	if (!intr && (static_cast<u32>(ctrl->put) & ~3u) == expected)
+	{
+		_umwait(0x0, utils::get_tsc() + cycles);
+	}
+}
+
+rsx_fifo_waitpkg_func static void rsx_fifo_umwait_memwatch(void* ptr, u32 addr, u32 expected, const rsx::atomic_bitmask_t<rsx::eng_interrupt_reason>& intr, u32 cycles) noexcept
+{
+	_umonitor(ptr);
+	if (!intr && vm::read32(addr) == expected)
+	{
+		_umwait(0x0, utils::get_tsc() + cycles);
+	}
+}
+#undef rsx_fifo_waitpkg_func
+#endif
 
 namespace rsx
 {
@@ -428,6 +456,29 @@ namespace rsx
 			m_remaining_commands = 0;
 		}
 
+		void FIFO_control::wait_idle(u32 cycles) const
+		{
+#if defined(ARCH_X64)
+			if (m_memwatch_addr && m_fifo_pos == m_memwatch_addr)
+			{
+				if (const u32 addr = translate_address(m_memwatch_addr); addr + 1)
+				{
+					rsx_fifo_umwait_memwatch(vm::base(addr), addr, m_memwatch_cmp, m_thread->eng_interrupt_mask, cycles);
+					return;
+				}
+			}
+
+			if (m_ctrl)
+			{
+				rsx_fifo_umwait_put(m_ctrl, m_fifo_pos, m_thread->eng_interrupt_mask, cycles);
+				return;
+			}
+#else
+			static_cast<void>(cycles);
+#endif
+			std::this_thread::yield();
+		}
+
 		void FIFO_control::read(register_pair& data)
 		{
 			if (m_remaining_commands)
@@ -774,6 +825,19 @@ namespace rsx
 				}
 				else
 				{
+					if (eng_interrupt_mask)
+					{
+						return;
+					}
+
+					const u64 idle_us = get_system_time() - performance_counters.FIFO_idle_timestamp;
+					if (idle_us >= 100 && !zcull_ctrl->has_pending() && utils::has_waitpkg())
+					{
+						fifo_ctrl->wait_idle(idle_us >= 1500 ? 85'000u : 45'000u);
+						m_cycles_counter = 0;
+						return;
+					}
+
 					std::this_thread::yield();
 				}
 
