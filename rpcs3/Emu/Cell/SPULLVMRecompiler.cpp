@@ -40,6 +40,7 @@ const extern spu_decoder<spu_iflag> g_spu_iflag;
 #endif
 #include <llvm/ADT/PostOrderIterator.h>
 #include <llvm/Analysis/PostDominators.h>
+#include <llvm/ExecutionEngine/ExecutionEngine.h>
 #include <llvm/IR/InlineAsm.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/TargetParser/Host.h>
@@ -87,6 +88,113 @@ namespace
 void spu_llvm_set_compile_context(spu_llvm_compile_context* context) noexcept
 {
 	g_spu_llvm_compile_context = context;
+}
+#endif
+
+#if defined(ARCH_X64) && !defined(DISABLE_SPU_SIMD_DYN_INSERT)
+namespace
+{
+	// On x86-64 AVX2 (without AVX-512), LLVM lowers dynamic-index insertelement on 128-bit
+	// vectors to a stack alloca (vmovaps store -> narrow scalar store -> vmovaps reload),
+	// triggering ~15-20 cycle store-to-load forwarding stalls and stack frame bloat.
+	// Rewriting to splat(idx) == {0..N-1} + select(cmp, splat(val), vec) stays 100% in XMM
+	// registers (vpbroadcast* + vpcmpeq* + vpblendvb/vblendvp*) and lets LICM/EarlyCSE
+	// hoist and share masks across CBD/CHD/CWD/CDD and SHUFB.
+	struct LowerDynamicInsertElementPass : llvm::PassInfoMixin<LowerDynamicInsertElementPass>
+	{
+		llvm::PreservedAnalyses run(llvm::Function& f, llvm::FunctionAnalysisManager&)
+		{
+			llvm::SmallVector<llvm::InsertElementInst*, 16> worklist;
+			for (auto& bb : f)
+			{
+				for (auto& inst : bb)
+				{
+					auto* ie = llvm::dyn_cast<llvm::InsertElementInst>(&inst);
+					if (!ie || llvm::isa<llvm::ConstantInt>(ie->getOperand(2)))
+						continue;
+
+					auto* fvt = llvm::dyn_cast<llvm::FixedVectorType>(ie->getType());
+					if (!fvt)
+						continue;
+
+					llvm::Type* elem_ty = fvt->getElementType();
+					if (!elem_ty->isIntegerTy() && !elem_ty->isFloatTy() && !elem_ty->isDoubleTy())
+						continue;
+
+					const u32 num_elems = fvt->getNumElements();
+					const u32 elem_bits = elem_ty->getScalarSizeInBits();
+					if (num_elems * elem_bits != 128)
+						continue;
+					if (elem_bits != 8 && elem_bits != 16 && elem_bits != 32 && elem_bits != 64)
+						continue;
+
+					worklist.push_back(ie);
+				}
+			}
+
+			if (worklist.empty())
+				return llvm::PreservedAnalyses::all();
+
+			auto& ctx = f.getContext();
+			static constexpr u8  seq8[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+			static constexpr u16 seq16[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+			static constexpr u32 seq32[4] = {0, 1, 2, 3};
+			static constexpr u64 seq64[2] = {0, 1};
+
+			for (auto* ie : worklist)
+			{
+				auto* fvt = llvm::cast<llvm::FixedVectorType>(ie->getType());
+				llvm::Type* elem_ty = fvt->getElementType();
+				const u32 num_elems = fvt->getNumElements();
+				const u32 elem_bits = elem_ty->getScalarSizeInBits();
+
+				llvm::IRBuilder<> ir(ie);
+				llvm::Value* vec = ie->getOperand(0);
+				llvm::Value* val = ie->getOperand(1);
+				llvm::Value* idx = ie->getOperand(2);
+
+				llvm::Type* int_elem_ty = llvm::IntegerType::get(ctx, elem_bits);
+				auto* int_vec_ty = llvm::FixedVectorType::get(int_elem_ty, num_elems);
+
+				llvm::Value* val_int = elem_ty->isIntegerTy() ? val : ir.CreateBitCast(val, int_elem_ty);
+				llvm::Value* val_splat = llvm::isa<llvm::Constant>(val_int)
+					? static_cast<llvm::Value*>(llvm::ConstantVector::getSplat(llvm::ElementCount::getFixed(num_elems), llvm::cast<llvm::Constant>(val_int)))
+					: ir.CreateVectorSplat(num_elems, val_int);
+
+				llvm::Value* res_int = nullptr;
+				if (llvm::isa<llvm::UndefValue>(vec))
+				{
+					res_int = val_splat;
+				}
+				else
+				{
+					llvm::Value* vec_int = elem_ty->isIntegerTy() ? vec : ir.CreateBitCast(vec, int_vec_ty);
+					llvm::Value* idx_cast = ir.CreateIntCast(idx, int_elem_ty, false);
+					llvm::Value* idx_splat = ir.CreateVectorSplat(num_elems, idx_cast);
+
+					llvm::Constant* lanes = nullptr;
+					switch (elem_bits)
+					{
+					case 8:  lanes = llvm::ConstantDataVector::get(ctx, llvm::ArrayRef<u8>(seq8)); break;
+					case 16: lanes = llvm::ConstantDataVector::get(ctx, llvm::ArrayRef<u16>(seq16)); break;
+					case 32: lanes = llvm::ConstantDataVector::get(ctx, llvm::ArrayRef<u32>(seq32)); break;
+					default: lanes = llvm::ConstantDataVector::get(ctx, llvm::ArrayRef<u64>(seq64)); break;
+					}
+
+					llvm::Value* cmp = ir.CreateICmpEQ(idx_splat, lanes);
+					res_int = ir.CreateSelect(cmp, val_splat, vec_int);
+				}
+
+				llvm::Value* res = elem_ty->isIntegerTy() ? res_int : ir.CreateBitCast(res_int, fvt);
+				ie->replaceAllUsesWith(res);
+				ie->eraseFromParent();
+			}
+
+			llvm::PreservedAnalyses pa;
+			pa.preserveSet<llvm::CFGAnalyses>();
+			return pa;
+		}
+	};
 }
 #endif
 
@@ -4110,11 +4218,9 @@ public:
 		CGSCCAnalysisManager cgam;
 		ModuleAnalysisManager mam;
 
-		// Create the new pass manager builder.
-		// Take a look at the PassBuilder constructor parameters for more
-		// customization, e.g. specifying a TargetMachine or various debugging
-		// options.
-		PassBuilder pb;
+		// Create the new pass manager builder bound to the host Arrow Lake TargetMachine
+		// so middle-end analyses receive accurate AVX2/FMA/shuffle TargetTransformInfo.
+		PassBuilder pb(m_jit.get_engine().getTargetMachine());
 
 		// Register all the basic analyses with the managers.
 		pb.registerModuleAnalyses(mam);
@@ -4129,8 +4235,16 @@ public:
 		fpm.addPass(SimplifyCFGPass());
 		fpm.addPass(InstCombinePass());
 		fpm.addPass(DSEPass());
+#if defined(ARCH_X64) && !defined(DISABLE_SPU_SIMD_DYN_INSERT)
+		if (m_use_avx && !m_use_avx512)
+		{
+			fpm.addPass(LowerDynamicInsertElementPass());
+		}
+#endif
 		fpm.addPass(createFunctionToLoopPassAdaptor(LICMPass(LICMOptions()), true));
 		fpm.addPass(ADCEPass());
+		fpm.addPass(EarlyCSEPass(true));
+		fpm.addPass(SimplifyCFGPass());
 
 		for (auto& f : *m_module)
 		{
