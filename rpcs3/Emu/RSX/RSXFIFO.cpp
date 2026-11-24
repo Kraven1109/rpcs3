@@ -10,6 +10,7 @@
 #include "NV47/HW/context.h"
 
 #include "util/asm.hpp"
+#include "util/sysinfo.hpp"
 
 #include <thread>
 
@@ -774,7 +775,15 @@ namespace rsx
 				}
 				else
 				{
-					std::this_thread::yield();
+					static const bool s_fifo_busy_wait = utils::get_thread_count() >= 12;
+					if (s_fifo_busy_wait)
+					{
+						busy_wait(64);
+					}
+					else
+					{
+						std::this_thread::yield();
+					}
 				}
 
 				return;
@@ -888,6 +897,40 @@ namespace rsx
 			performance_counters.idle_time += (get_system_time() - performance_counters.FIFO_idle_timestamp);
 		}
 
+		auto run_flattener = [&](FIFO::register_pair& cmd) -> bool
+		{
+			switch (m_flattener.test(cmd))
+			{
+			case FIFO::NOTHING:
+			{
+				break;
+			}
+			case FIFO::EMIT_END:
+			{
+				// Emit end command to close existing scope and sync register state
+				AUDIT(m_ctx->in_begin_end);
+				m_ctx->register_state->decode(NV4097_SET_BEGIN_END, 0);
+				methods[NV4097_SET_BEGIN_END](m_ctx, NV4097_SET_BEGIN_END, 0);
+				break;
+			}
+			case FIFO::EMIT_BARRIER:
+			{
+				AUDIT(m_ctx->in_begin_end);
+				m_ctx->register_state->decode(NV4097_SET_BEGIN_END, 0);
+				methods[NV4097_SET_BEGIN_END](m_ctx, NV4097_SET_BEGIN_END, 0);
+				m_ctx->register_state->decode(NV4097_SET_BEGIN_END, m_flattener.get_primitive());
+				methods[NV4097_SET_BEGIN_END](m_ctx, NV4097_SET_BEGIN_END, m_flattener.get_primitive());
+				break;
+			}
+			default:
+			{
+				fmt::throw_exception("Unreachable");
+			}
+			}
+
+			return cmd.reg != FIFO::FIFO_DISABLED_COMMAND;
+		};
+
 		do
 		{
 			if (capture_current_frame) [[unlikely]]
@@ -951,39 +994,10 @@ namespace rsx
 				}
 			}
 
-			if (m_flattener.is_enabled()) [[unlikely]]
+			if (m_flattener.is_enabled() && !run_flattener(command)) [[unlikely]]
 			{
-				switch(m_flattener.test(command))
-				{
-				case FIFO::NOTHING:
-				{
-					break;
-				}
-				case FIFO::EMIT_END:
-				{
-					// Emit end command to close existing scope
-					AUDIT(m_ctx->in_begin_end);
-					methods[NV4097_SET_BEGIN_END](m_ctx, NV4097_SET_BEGIN_END, 0);
-					break;
-				}
-				case FIFO::EMIT_BARRIER:
-				{
-					AUDIT(m_ctx->in_begin_end);
-					methods[NV4097_SET_BEGIN_END](m_ctx, NV4097_SET_BEGIN_END, 0);
-					methods[NV4097_SET_BEGIN_END](m_ctx, NV4097_SET_BEGIN_END, m_flattener.get_primitive());
-					break;
-				}
-				default:
-				{
-					fmt::throw_exception("Unreachable");
-				}
-				}
-
-				if (command.reg == FIFO::FIFO_DISABLED_COMMAND)
-				{
-					// Optimized away
-					continue;
-				}
+				// Optimized away
+				continue;
 			}
 
 			const u32 reg = (command.reg & 0xffff) >> 2;
@@ -1015,6 +1029,13 @@ namespace rsx
 			}
 		}
 		while (fifo_ctrl->read_unsafe(command));
+
+		if (m_flattener.is_enabled() && m_flattener.get_primitive() && !(state & cpu_flag::again)) [[unlikely]]
+		{
+			// Flush any deferred END before publishing GET to PPU/SPU or crossing FIFO control commands
+			FIFO::register_pair flush_cmd{ static_cast<u32>(NV4097_NO_OPERATION << 2), 0 };
+			run_flattener(flush_cmd);
+		}
 
 		fifo_ctrl->sync_get();
 	}
