@@ -72,6 +72,24 @@ static bool has_waitv()
 #include "endian.hpp"
 #include "tsc.hpp"
 
+#if defined(ARCH_X64)
+#include "sysinfo.hpp"
+#include <immintrin.h>
+#if !defined(_MSC_VER)
+__attribute__((__target__("waitpkg")))
+#endif
+static bool waitpkg_umwait_c02(const std::atomic<u32>* atomic_ptr, u32 old_value, u32 cycles) noexcept
+{
+	_umonitor(const_cast<void*>(static_cast<const volatile void*>(atomic_ptr)));
+	if (atomic_ptr->load(std::memory_order_acquire) != old_value)
+	{
+		return true;
+	}
+	_umwait(0x0, utils::get_tsc() + cycles);
+	return atomic_ptr->load(std::memory_order_acquire) != old_value;
+}
+#endif
+
 // Total number of entries.
 static constexpr usz s_hashtable_size = 1u << 17;
 
@@ -897,6 +915,29 @@ FORCE_INLINE auto root_info::slot_search(uptr iptr, F func) noexcept
 SAFE_BUFFERS(void)
 atomic_wait_engine::wait(const void* data, u32 old_value, u64 timeout, atomic_wait::info* ext)
 {
+#if defined(ARCH_X64)
+	static const bool s_enable_waitpkg_bypass = utils::has_waitpkg() && utils::get_thread_count() >= 12;
+	// Only pre-spin for indefinite waits (timeout == umax); callers with finite timeouts
+	// (e.g., SPU/RSXOffload adaptive idle loops) have already spun before requesting futex sleep.
+	if (s_enable_waitpkg_bypass && !ext && timeout == umax) [[likely]]
+	{
+		const auto* atomic_ptr = reinterpret_cast<const std::atomic<u32>*>(data);
+		for (u32 spin = 0; spin < 16; ++spin)
+		{
+			if (atomic_ptr->load(std::memory_order_acquire) != old_value)
+			{
+				return;
+			}
+			utils::pause();
+		}
+
+		if (waitpkg_umwait_c02(atomic_ptr, old_value, 2000u))
+		{
+			return;
+		}
+	}
+#endif
+
 	uint ext_size = 0;
 
 #ifdef __linux__
