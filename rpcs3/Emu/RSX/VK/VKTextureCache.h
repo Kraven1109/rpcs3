@@ -249,8 +249,18 @@ namespace vk
 				target = vk::get_typeless_helper(vram_texture->format(), vram_texture->format_class(), transfer_width, transfer_height);
 				target->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
+#ifndef RPCS3_DISABLE_TILED_DETILE_READBACK_FIX
+				const VkFormat target_fmt = target->format();
+				const bool is_float_color =
+					target_fmt == VK_FORMAT_R16G16B16A16_SFLOAT ||
+					target_fmt == VK_FORMAT_R32G32B32A32_SFLOAT ||
+					target_fmt == VK_FORMAT_R32_SFLOAT;
+				// Allow bilinear filtering on non-float color textures where compatibility is likely
+				const auto filter = (target->aspect() == VK_IMAGE_ASPECT_COLOR_BIT && !is_float_color) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+#else
 				// Allow bilinear filtering on color textures where compatibility is likely
 				const auto filter = (target->aspect() == VK_IMAGE_ASPECT_COLOR_BIT) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+#endif
 
 				vk::copy_scaled_image(cmd, locked_resource, target,
 					areai{ 0, 0, static_cast<s32>(locked_resource->width()), static_cast<s32>(locked_resource->height()) },
