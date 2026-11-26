@@ -9,6 +9,10 @@
 #include "Emu/RSX/RSXThread.h"
 #include "Emu/RSX/rsx_methods.h"
 #include "Emu/system_config.h"
+#include "util/asm.hpp"
+
+#include <chrono>
+#include <thread>
 
 #include "Emu/RSX/NV47/HW/context_accessors.define.h"
 
@@ -997,8 +1001,82 @@ namespace rsx
 		const auto [program_offset, program_location] = REGS(m_ctx)->shader_program_address();
 		const auto prev_textures_reference_mask = m_ctx->program.fp_metadata.referenced_textures_mask;
 
-		auto data_ptr = vm::base(rsx::get_address(m_ctx, program_offset, program_location));
+		const u32 rsx_addr = rsx::get_address(m_ctx, program_offset, program_location);
+		auto data_ptr = vm::base(rsx_addr);
+
+#ifndef DISABLE_RSX_FP_UCODE_RACE_GUARD
+		// Guard against PPU/SPU vs RSX FIFO race where transient leading zeroed ucode
+		// makes analyse_fragment_program() walk off into an unintended or NOP shader.
+		const auto* wp = static_cast<const volatile u32*>(data_ptr);
+		if ((wp[0] | wp[1] | wp[2] | wp[3]) != 0u) [[likely]]
+		{
+			m_ctx->program.fp_metadata = program_hash_util::fragment_program_utils::analyse_fragment_program(data_ptr);
+		}
+		else [[unlikely]]
+		{
+			const auto t_start = std::chrono::steady_clock::now();
+			u32 iter = 0;
+			s64 elapsed_us = 0;
+
+			while ((wp[0] | wp[1] | wp[2] | wp[3]) == 0u)
+			{
+				elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+					std::chrono::steady_clock::now() - t_start).count();
+				if (elapsed_us >= 2000 || RSX(m_ctx)->test_stopped())
+				{
+					break;
+				}
+				if (iter < 32u)
+				{
+					utils::pause();
+				}
+				else
+				{
+					std::this_thread::sleep_for(std::chrono::microseconds(20));
+				}
+				++iter;
+			}
+
+			if ((wp[0] | wp[1] | wp[2] | wp[3]) != 0u)
+			{
+				auto meta = program_hash_util::fragment_program_utils::analyse_fragment_program(data_ptr);
+				for (int pass = 0; pass < 5; ++pass)
+				{
+					if (RSX(m_ctx)->test_stopped())
+					{
+						break;
+					}
+					std::this_thread::sleep_for(std::chrono::microseconds(30));
+					const auto next_meta = program_hash_util::fragment_program_utils::analyse_fragment_program(data_ptr);
+					const bool stable =
+						(next_meta.program_start_offset == meta.program_start_offset) &&
+						(next_meta.program_ucode_length == meta.program_ucode_length) &&
+						(next_meta.is_nop_shader == meta.is_nop_shader);
+					meta = next_meta;
+					if (stable)
+					{
+						break;
+					}
+				}
+
+				elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+					std::chrono::steady_clock::now() - t_start).count();
+				rsx_log.warning("RSX: Recovered from transient zeroed fragment program at 0x%x (offset=0x%x) after %lld us (start=0x%x len=%u)",
+					rsx_addr,
+					program_offset,
+					static_cast<long long>(elapsed_us),
+					static_cast<u32>(meta.program_start_offset),
+					meta.program_ucode_length);
+				m_ctx->program.fp_metadata = meta;
+			}
+			else
+			{
+				m_ctx->program.fp_metadata = program_hash_util::fragment_program_utils::analyse_fragment_program(data_ptr);
+			}
+		}
+#else
 		m_ctx->program.fp_metadata = program_hash_util::fragment_program_utils::analyse_fragment_program(data_ptr);
+#endif
 
 		m_ctx->program.fragment_program.data = (static_cast<u8*>(data_ptr) + m_ctx->program.fp_metadata.program_start_offset);
 		m_ctx->program.fragment_program.offset = program_offset + m_ctx->program.fp_metadata.program_start_offset;

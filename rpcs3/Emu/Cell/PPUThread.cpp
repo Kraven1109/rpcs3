@@ -46,6 +46,10 @@
 #include <llvm/Analysis/LoopAnalysisManager.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Transforms/Scalar/EarlyCSE.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
+#include <llvm/Transforms/Scalar/LoopPassManager.h>
+#include <llvm/Transforms/Scalar/LICM.h>
+#include <llvm/Transforms/Scalar/ADCE.h>
 #ifdef _MSC_VER
 #pragma warning(pop)
 #else
@@ -5813,7 +5817,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 				settings += ppu_settings::accurate_vest;
 
 			// Write version, hash, CPU, settings
-			fmt::append(obj_name, "v9-kusa-%s-%s-%s.obj", fmt::base57(output, 16), fmt::base57(settings), jit_compiler::cpu(g_cfg.core.llvm_cpu.to_string()));
+			fmt::append(obj_name, "v18-kusa-%s-%s-%s.obj", fmt::base57(output, 16), fmt::base57(settings), jit_compiler::cpu(g_cfg.core.llvm_cpu.to_string()));
 		}
 
 		if (cpu ? cpu->state.all_of(cpu_flag::exit) : Emu.IsStopped())
@@ -6319,11 +6323,8 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 		CGSCCAnalysisManager cgam;
 		ModuleAnalysisManager mam;
 
-		// Create the new pass manager builder.
-		// Take a look at the PassBuilder constructor parameters for more
-		// customization, e.g. specifying a TargetMachine or various debugging
-		// options.
-		PassBuilder pb;
+		// Bind TargetMachine so PPU passes use Arrow Lake TargetTransformInfo.
+		PassBuilder pb(jit.get_engine().getTargetMachine());
 
 		// Register all the basic analyses with the managers.
 		pb.registerModuleAnalyses(mam);
@@ -6333,8 +6334,11 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 		pb.crossRegisterProxies(lam, fam, cgam, mam);
 
 		FunctionPassManager fpm;
-		// Basic optimizations
+		// Safe PPU middle-end pipeline (omits DSEPass due to guest memory alias hang in C23)
 		fpm.addPass(EarlyCSEPass());
+		fpm.addPass(InstCombinePass());
+		fpm.addPass(createFunctionToLoopPassAdaptor(LICMPass(LICMOptions()), true));
+		fpm.addPass(ADCEPass());
 
 		u32 guest_code_size = 0;
 		u32 min_addr = umax;

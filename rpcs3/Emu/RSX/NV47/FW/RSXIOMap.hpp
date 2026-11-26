@@ -57,10 +57,43 @@ namespace rsx
 			return this->ea[offs >> 20] | (offs & 0xFFFFF);
 		}
 
+		bool is_mapped(u32 addr, u32 len) const noexcept
+		{
+			if (len <= 1) return false;
+			const u32 end = addr + len - 1;
+			if (end < addr) [[unlikely]] return true;
+
+			const u32 p0 = addr >> 20;
+			const u32 p1 = end >> 20;
+			if (p0 == p1) [[likely]]
+			{
+				return io[p0].load() != umax;
+			}
+
+			for (u32 p = p0; p <= p1; ++p)
+			{
+				if (io[p].load() != umax)
+				{
+					return true;
+				}
+			}
+
+			return false;
+		}
+
 		template <bool IsFullLock, uint Stride>
 		bool lock(u32 addr, u32 len, cpu_thread* self = nullptr) noexcept
 		{
 			if (len <= 1) return false;
+
+			if constexpr (!IsFullLock)
+			{
+				if (!is_mapped(addr, len)) [[likely]]
+				{
+					return false;
+				}
+			}
+
 			const u32 end = addr + len - 1;
 
 			bool added_wait = false;

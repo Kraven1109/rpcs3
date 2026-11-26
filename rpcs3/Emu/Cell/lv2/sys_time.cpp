@@ -8,6 +8,7 @@
 #include "util/tsc.hpp"
 
 #include "util/sysinfo.hpp"
+#include <numeric>
 
 u64 g_timebase_offs{};
 static u64 systemtime_offset;
@@ -156,7 +157,32 @@ u64 get_timebased_time()
 	{
 		const u64 tsc = utils::get_tsc();
 
-#if _MSC_VER
+#if defined(__SIZEOF_INT128__)
+		static atomic_t<u64> s_cached_tb_freq{0};
+		static atomic_t<u64> s_cached_tb_recip{0};
+		u64 tb_ticks;
+		if (s_cached_tb_freq.load() == freq) [[likely]]
+		{
+			const u64 r = s_cached_tb_recip.observe();
+			tb_ticks = static_cast<u64>((static_cast<unsigned __int128>(tsc) * r) >> 64);
+		}
+		else if (freq > g_timebase_freq)
+		{
+			const u64 r = static_cast<u64>((static_cast<unsigned __int128>(g_timebase_freq) << 64) / freq);
+			s_cached_tb_recip.release(r);
+			s_cached_tb_freq.release(freq);
+			tb_ticks = static_cast<u64>((static_cast<unsigned __int128>(tsc) * r) >> 64);
+		}
+		else
+		{
+			const u64 g = std::gcd(g_timebase_freq, freq);
+			const u64 num = g_timebase_freq / g;
+			const u64 den = freq / g;
+			tb_ticks = static_cast<u64>((static_cast<unsigned __int128>(tsc) * num) / den);
+		}
+		const u32 scale = g_cfg.core.clocks_scale;
+		const u64 result = (scale == 100u) ? tb_ticks : (tb_ticks * scale / 100u);
+#elif _MSC_VER
 		const u64 result = static_cast<u64>(u128_from_mul(tsc, g_timebase_freq) / freq) * g_cfg.core.clocks_scale / 100u;
 #else
 		const u64 result = (tsc / freq * g_timebase_freq + tsc % freq * g_timebase_freq / freq) * g_cfg.core.clocks_scale / 100u;
@@ -216,7 +242,26 @@ u64 get_system_time()
 	{
 		const u64 tsc = utils::get_tsc();
 
-#if _MSC_VER
+#if defined(__SIZEOF_INT128__)
+		static atomic_t<u64> s_cached_freq{0};
+		static atomic_t<u64> s_cached_recip{0};
+		if (s_cached_freq.load() == freq) [[likely]]
+		{
+			const u64 r = s_cached_recip.observe();
+			return static_cast<u64>((static_cast<unsigned __int128>(tsc) * r) >> 64);
+		}
+		if (freq > 1'000'000ull)
+		{
+			const u64 r = static_cast<u64>((static_cast<unsigned __int128>(1000000ull) << 64) / freq);
+			s_cached_recip.release(r);
+			s_cached_freq.release(freq);
+			return static_cast<u64>((static_cast<unsigned __int128>(tsc) * r) >> 64);
+		}
+		const u64 g = std::gcd(1000000ull, freq);
+		const u64 num = 1000000ull / g;
+		const u64 den = freq / g;
+		const u64 result = static_cast<u64>((static_cast<unsigned __int128>(tsc) * num) / den);
+#elif _MSC_VER
 		const u64 result = static_cast<u64>(u128_from_mul(tsc, 1000000ull) / freq);
 #else
 		const u64 result = (tsc / freq * 1000000ull + tsc % freq * 1000000ull / freq);

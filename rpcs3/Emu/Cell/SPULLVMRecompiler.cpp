@@ -20,6 +20,7 @@
 #include "util/v128.hpp"
 #include "util/simd.hpp"
 #include "util/sysinfo.hpp"
+#include "util/asm.hpp"
 
 const extern spu_decoder<spu_itype> g_spu_itype;
 const extern spu_decoder<spu_iname> g_spu_iname;
@@ -40,6 +41,7 @@ const extern spu_decoder<spu_iflag> g_spu_iflag;
 #endif
 #include <llvm/ADT/PostOrderIterator.h>
 #include <llvm/Analysis/PostDominators.h>
+#include <llvm/ExecutionEngine/ExecutionEngine.h>
 #include <llvm/IR/InlineAsm.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/TargetParser/Host.h>
@@ -87,6 +89,113 @@ namespace
 void spu_llvm_set_compile_context(spu_llvm_compile_context* context) noexcept
 {
 	g_spu_llvm_compile_context = context;
+}
+#endif
+
+#if defined(ARCH_X64) && !defined(DISABLE_SPU_SIMD_DYN_INSERT)
+namespace
+{
+	// On x86-64 AVX2 (without AVX-512), LLVM lowers dynamic-index insertelement on 128-bit
+	// vectors to a stack alloca (vmovaps store -> narrow scalar store -> vmovaps reload),
+	// triggering ~15-20 cycle store-to-load forwarding stalls and stack frame bloat.
+	// Rewriting to splat(idx) == {0..N-1} + select(cmp, splat(val), vec) stays 100% in XMM
+	// registers (vpbroadcast* + vpcmpeq* + vpblendvb/vblendvp*) and lets LICM/EarlyCSE
+	// hoist and share masks across CBD/CHD/CWD/CDD and SHUFB.
+	struct LowerDynamicInsertElementPass : llvm::PassInfoMixin<LowerDynamicInsertElementPass>
+	{
+		llvm::PreservedAnalyses run(llvm::Function& f, llvm::FunctionAnalysisManager&)
+		{
+			llvm::SmallVector<llvm::InsertElementInst*, 16> worklist;
+			for (auto& bb : f)
+			{
+				for (auto& inst : bb)
+				{
+					auto* ie = llvm::dyn_cast<llvm::InsertElementInst>(&inst);
+					if (!ie || llvm::isa<llvm::ConstantInt>(ie->getOperand(2)))
+						continue;
+
+					auto* fvt = llvm::dyn_cast<llvm::FixedVectorType>(ie->getType());
+					if (!fvt)
+						continue;
+
+					llvm::Type* elem_ty = fvt->getElementType();
+					if (!elem_ty->isIntegerTy() && !elem_ty->isFloatTy() && !elem_ty->isDoubleTy())
+						continue;
+
+					const u32 num_elems = fvt->getNumElements();
+					const u32 elem_bits = elem_ty->getScalarSizeInBits();
+					if (num_elems * elem_bits != 128)
+						continue;
+					if (elem_bits != 8 && elem_bits != 16 && elem_bits != 32 && elem_bits != 64)
+						continue;
+
+					worklist.push_back(ie);
+				}
+			}
+
+			if (worklist.empty())
+				return llvm::PreservedAnalyses::all();
+
+			auto& ctx = f.getContext();
+			static constexpr u8  seq8[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+			static constexpr u16 seq16[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+			static constexpr u32 seq32[4] = {0, 1, 2, 3};
+			static constexpr u64 seq64[2] = {0, 1};
+
+			for (auto* ie : worklist)
+			{
+				auto* fvt = llvm::cast<llvm::FixedVectorType>(ie->getType());
+				llvm::Type* elem_ty = fvt->getElementType();
+				const u32 num_elems = fvt->getNumElements();
+				const u32 elem_bits = elem_ty->getScalarSizeInBits();
+
+				llvm::IRBuilder<> ir(ie);
+				llvm::Value* vec = ie->getOperand(0);
+				llvm::Value* val = ie->getOperand(1);
+				llvm::Value* idx = ie->getOperand(2);
+
+				llvm::Type* int_elem_ty = llvm::IntegerType::get(ctx, elem_bits);
+				auto* int_vec_ty = llvm::FixedVectorType::get(int_elem_ty, num_elems);
+
+				llvm::Value* val_int = elem_ty->isIntegerTy() ? val : ir.CreateBitCast(val, int_elem_ty);
+				llvm::Value* val_splat = llvm::isa<llvm::Constant>(val_int)
+					? static_cast<llvm::Value*>(llvm::ConstantVector::getSplat(llvm::ElementCount::getFixed(num_elems), llvm::cast<llvm::Constant>(val_int)))
+					: ir.CreateVectorSplat(num_elems, val_int);
+
+				llvm::Value* res_int = nullptr;
+				if (llvm::isa<llvm::UndefValue>(vec))
+				{
+					res_int = val_splat;
+				}
+				else
+				{
+					llvm::Value* vec_int = elem_ty->isIntegerTy() ? vec : ir.CreateBitCast(vec, int_vec_ty);
+					llvm::Value* idx_cast = ir.CreateIntCast(idx, int_elem_ty, false);
+					llvm::Value* idx_splat = ir.CreateVectorSplat(num_elems, idx_cast);
+
+					llvm::Constant* lanes = nullptr;
+					switch (elem_bits)
+					{
+					case 8:  lanes = llvm::ConstantDataVector::get(ctx, llvm::ArrayRef<u8>(seq8)); break;
+					case 16: lanes = llvm::ConstantDataVector::get(ctx, llvm::ArrayRef<u16>(seq16)); break;
+					case 32: lanes = llvm::ConstantDataVector::get(ctx, llvm::ArrayRef<u32>(seq32)); break;
+					default: lanes = llvm::ConstantDataVector::get(ctx, llvm::ArrayRef<u64>(seq64)); break;
+					}
+
+					llvm::Value* cmp = ir.CreateICmpEQ(idx_splat, lanes);
+					res_int = ir.CreateSelect(cmp, val_splat, vec_int);
+				}
+
+				llvm::Value* res = elem_ty->isIntegerTy() ? res_int : ir.CreateBitCast(res_int, fvt);
+				ie->replaceAllUsesWith(res);
+				ie->eraseFromParent();
+			}
+
+			llvm::PreservedAnalyses pa;
+			pa.preserveSet<llvm::CFGAnalyses>();
+			return pa;
+		}
+	};
 }
 #endif
 
@@ -159,6 +268,7 @@ class spu_llvm_recompiler : public spu_recompiler_base, public cpu_translator
 	llvm::MDNode* m_md_likely{};
 	llvm::MDNode* m_md_spu_memory_domain{};
 	llvm::MDNode* m_md_spu_context_domain{};
+
 
 	struct block_info
 	{
@@ -3997,7 +4107,11 @@ public:
 										}
 									}
 
+#ifndef RPCS3_DISABLE_LOG_SPAM_OPT
+									spu_log.trace("Postponed r%u store from block 0x%x (single)", i, block_q[bi].first);
+#else
 									spu_log.warning("Postponed r%u store from block 0x%x (single)", i, block_q[bi].first);
+#endif
 								}
 								else
 								{
@@ -4038,7 +4152,11 @@ public:
 										pdt.recalculate(*m_function);
 										dt.recalculate(*m_function);
 
+#ifndef RPCS3_DISABLE_LOG_SPAM_OPT
+										spu_log.trace("Postponed r%u store from block 0x%x (multiple)", i, block_q[bi].first);
+#else
 										spu_log.warning("Postponed r%u store from block 0x%x (multiple)", i, block_q[bi].first);
+#endif
 									}
 
 									ins = edge->getTerminator();
@@ -4110,11 +4228,9 @@ public:
 		CGSCCAnalysisManager cgam;
 		ModuleAnalysisManager mam;
 
-		// Create the new pass manager builder.
-		// Take a look at the PassBuilder constructor parameters for more
-		// customization, e.g. specifying a TargetMachine or various debugging
-		// options.
-		PassBuilder pb;
+		// Create the new pass manager builder bound to the host Arrow Lake TargetMachine
+		// so middle-end analyses receive accurate AVX2/FMA/shuffle TargetTransformInfo.
+		PassBuilder pb(m_jit.get_engine().getTargetMachine());
 
 		// Register all the basic analyses with the managers.
 		pb.registerModuleAnalyses(mam);
@@ -4129,8 +4245,17 @@ public:
 		fpm.addPass(SimplifyCFGPass());
 		fpm.addPass(InstCombinePass());
 		fpm.addPass(DSEPass());
+#if defined(ARCH_X64) && !defined(DISABLE_SPU_SIMD_DYN_INSERT)
+		if (m_use_avx && !m_use_avx512)
+		{
+			fpm.addPass(LowerDynamicInsertElementPass());
+		}
+#endif
 		fpm.addPass(createFunctionToLoopPassAdaptor(LICMPass(LICMOptions()), true));
 		fpm.addPass(ADCEPass());
+		fpm.addPass(EarlyCSEPass(true));
+		fpm.addPass(SimplifyCFGPass());
+
 
 		for (auto& f : *m_module)
 		{
@@ -4873,12 +4998,90 @@ public:
 		return exec_rdch(_spu, SPU_RdInMbox);
 	}
 
+#ifndef RPCS3_DISABLE_FPSW_SPU_IDLE_OPT
+#if defined(ARCH_X64)
+#if defined(_MSC_VER)
+	static void spu_dec_tpause(u32 cycles) noexcept
+#else
+	__attribute__((__target__("waitpkg"))) static void spu_dec_tpause(u32 cycles) noexcept
+#endif
+	{
+		_tpause(0x0, utils::get_tsc() + cycles);
+	}
+#endif
+#endif
+
 	static u32 exec_read_dec(spu_thread* _spu)
 	{
 		const u32 res = _spu->read_dec().first;
 
 		if (res > 1500 && g_cfg.core.spu_loop_detection)
 		{
+#ifndef RPCS3_DISABLE_FPSW_SPU_IDLE_OPT
+			// Preserve ultra-low-latency upstream yield on uncapped titles (Frame limit: Infinite/Off) or
+			// titles explicitly opting into SPU Reservation Busy Waiting (e.g. TLOU, Killzone 2 60 FPS).
+			if (!g_cfg.core.spu_reservation_busy_waiting_enabled &&
+				g_cfg.video.frame_limit != frame_limit_type::infinite &&
+				g_cfg.video.frame_limit != frame_limit_type::none)
+			{
+				thread_local u64 tl_exit_tsc = 0;
+				thread_local u64 tl_spin_start_tsc = 0;
+				thread_local u32 tl_last_dec = 0;
+				thread_local u32 tl_streak = 0;
+
+				const u64 entry_tsc = utils::get_tsc();
+				const u64 work_tsc = entry_tsc - tl_exit_tsc;
+
+				// Measure pure guest work between calls (from previous exit to this entry).
+				// Tight decrementer polling loops (e.g. Frostbite 3) do <3us (<8000 TSC) of guest work per poll.
+				if (work_tsc <= 8'000 && res <= tl_last_dec)
+				{
+					if (tl_streak < 256)
+					{
+						++tl_streak;
+					}
+				}
+				else
+				{
+					tl_streak = 1;
+					tl_spin_start_tsc = entry_tsc;
+				}
+				tl_last_dec = res;
+
+				const u64 tsc_freq = utils::get_tsc_freq();
+				// ~500us threshold: escalate to alertable OS C6/C8 sleep once a thread spins idle continuously.
+				const u64 spin_sleep_thresh_tsc = tsc_freq ? (tsc_freq / 2000u) : 1'350'000u;
+
+				_spu->state += cpu_flag::wait;
+				if (tl_streak <= 2)
+				{
+					std::this_thread::yield();
+				}
+#if defined(ARCH_X64)
+				else if ((entry_tsc - tl_spin_start_tsc) < spin_sleep_thresh_tsc && utils::has_waitpkg())
+				{
+					spu_dec_tpause(10'000u);
+				}
+#endif
+				else if ((entry_tsc - tl_spin_start_tsc) >= spin_sleep_thresh_tsc)
+				{
+					u64 sleep_us = ((entry_tsc - tl_spin_start_tsc) >= spin_sleep_thresh_tsc * 4u) ? 50u : 25u;
+					if (res < 0x80000000u)
+					{
+						// 79.8 MHz PS3 decrementer (~80 ticks/us): keep >=50% safety margin so we never oversleep
+						sleep_us = std::min<u64>(sleep_us, std::max<u64>(15u, static_cast<u64>(res - 1500u) / 160u));
+					}
+					thread_ctrl::wait_for(sleep_us, true);
+				}
+				else
+				{
+					std::this_thread::yield();
+				}
+				static_cast<void>(_spu->test_stopped());
+				tl_exit_tsc = utils::get_tsc();
+				return res;
+			}
+#endif
 			_spu->state += cpu_flag::wait;
 			std::this_thread::yield();
 			static_cast<void>(_spu->test_stopped());
@@ -8612,7 +8815,7 @@ public:
 			const auto a = value<f32[4]>(ci->getOperand(0));
 			const auto b = value<f32[4]>(ci->getOperand(1));
 
-			return a + b;
+			return eval(a + b);
 		});
 
 		set_vr(op.rt, fa(get_vr<f32[4]>(op.ra), get_vr<f32[4]>(op.rb)));

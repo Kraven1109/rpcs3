@@ -447,6 +447,20 @@ error_code sys_timer_sleep(ppu_thread& ppu, u32 sleep_time)
 	return sys_timer_usleep(ppu, sleep_time * u64{1000000});
 }
 
+#if defined(ARCH_X64)
+#if defined(_MSC_VER)
+#define sys_timer_waitpkg_func
+#else
+#define sys_timer_waitpkg_func __attribute__((__target__("waitpkg")))
+#endif
+
+sys_timer_waitpkg_func static void sys_timer_tpause_c02(u32 cycles) noexcept
+{
+	_tpause(0x0, utils::get_tsc() + cycles);
+}
+#undef sys_timer_waitpkg_func
+#endif
+
 error_code sys_timer_usleep(ppu_thread& ppu, u64 sleep_time)
 {
 	ppu.state += cpu_flag::wait;
@@ -476,6 +490,12 @@ error_code sys_timer_usleep(ppu_thread& ppu, u64 sleep_time)
 	}
 	else
 	{
+#if defined(ARCH_X64)
+		if (utils::has_appropriate_um_wait() && utils::has_waitpkg())
+		{
+			sys_timer_tpause_c02(3000);
+		}
+#endif
 		std::this_thread::yield();
 	}
 

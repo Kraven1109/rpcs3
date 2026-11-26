@@ -126,7 +126,12 @@ namespace vk
 				break;
 			case driver_vendor::ANV:
 			case driver_vendor::NVIDIA:
+#ifdef __linux__
+				// XWayland can invalidate X11 swapchain drawables asynchronously before Acquire/Present catches up
+				m_wm_reports_flag = (::getenv("WAYLAND_DISPLAY") == nullptr);
+#else
 				m_wm_reports_flag = true;
+#endif
 				break;
 			default:
 				break;
