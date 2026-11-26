@@ -3997,7 +3997,11 @@ public:
 										}
 									}
 
+#ifndef RPCS3_DISABLE_LOG_SPAM_OPT
+									spu_log.trace("Postponed r%u store from block 0x%x (single)", i, block_q[bi].first);
+#else
 									spu_log.warning("Postponed r%u store from block 0x%x (single)", i, block_q[bi].first);
+#endif
 								}
 								else
 								{
@@ -4038,7 +4042,11 @@ public:
 										pdt.recalculate(*m_function);
 										dt.recalculate(*m_function);
 
+#ifndef RPCS3_DISABLE_LOG_SPAM_OPT
+										spu_log.trace("Postponed r%u store from block 0x%x (multiple)", i, block_q[bi].first);
+#else
 										spu_log.warning("Postponed r%u store from block 0x%x (multiple)", i, block_q[bi].first);
+#endif
 									}
 
 									ins = edge->getTerminator();

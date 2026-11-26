@@ -126,12 +126,32 @@ namespace rsx
 		}
 	}
 
+#ifndef RPCS3_DISABLE_LOG_SPAM_OPT
+	static void log_invalid_av_format_once(u8 format)
+	{
+		static atomic_t<u64> s_logged_mask{ 0 };
+		const u64 bit = 1ull << (format < 63 ? format : 63);
+		if ((s_logged_mask.fetch_or(bit) & bit) == 0)
+		{
+			rsx_log.error("Invalid AV format 0x%x (suppressing further identical messages)", format);
+		}
+		else
+		{
+			rsx_log.trace("Invalid AV format 0x%x", format);
+		}
+	}
+#endif
+
 	u32 avconf::get_compatible_gcm_format() const
 	{
 		switch (format)
 		{
 		default:
+#ifndef RPCS3_DISABLE_LOG_SPAM_OPT
+			log_invalid_av_format_once(format);
+#else
 			rsx_log.error("Invalid AV format 0x%x", format);
+#endif
 			[[fallthrough]];
 		case CELL_VIDEO_OUT_BUFFER_COLOR_FORMAT_X8R8G8B8:
 		case CELL_VIDEO_OUT_BUFFER_COLOR_FORMAT_X8B8G8R8:
@@ -146,7 +166,11 @@ namespace rsx
 		switch (format)
 		{
 		default:
+#ifndef RPCS3_DISABLE_LOG_SPAM_OPT
+			log_invalid_av_format_once(format);
+#else
 			rsx_log.error("Invalid AV format 0x%x", format);
+#endif
 			[[fallthrough]];
 		case CELL_VIDEO_OUT_BUFFER_COLOR_FORMAT_X8R8G8B8:
 		case CELL_VIDEO_OUT_BUFFER_COLOR_FORMAT_X8B8G8R8:
