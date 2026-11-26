@@ -2752,6 +2752,39 @@ namespace rsx
 					}
 				}
 
+#ifndef RPCS3_DISABLE_ATLAS_WAW_AND_PRUNE_FIX
+				if (_pool == 0 && overlapping_fbos.size() > 8)
+				{
+					u32 coverage_size = 0;
+					for (const auto& section : overlapping_fbos)
+					{
+						coverage_size += section.surface->get_native_pitch() * section.surface->template get_surface_height<rsx::surface_metrics::bytes>();
+					}
+
+					if (memory_range.length() > 0 && (coverage_size * 100ull) > (memory_range.length() * 125ull))
+					{
+						m_rtts.check_for_duplicates(overlapping_fbos);
+						overlapping_fbos.erase_if([&](const auto& s)
+						{
+							return m_rtts.get_surface_at(s.base_address) != s.surface;
+						});
+
+						if (overlapping_fbos.empty() && overlapping_locals.empty())
+						{
+							return {};
+						}
+
+						if (!options.prefer_surface_cache && !overlapping_fbos.empty())
+						{
+							if (auto fast_res = fast_fbo_check(); fast_res.validate())
+							{
+								return fast_res;
+							}
+						}
+					}
+				}
+#endif
+
 				auto result = helpers::merge_cache_resources<sampled_image_descriptor>(
 					cmd, overlapping_fbos, overlapping_locals, attr, scale, extended_dimension, remap, _pool);
 
@@ -2811,6 +2844,7 @@ namespace rsx
 					return {};
 				}
 
+#ifdef RPCS3_DISABLE_ATLAS_WAW_AND_PRUNE_FIX
 				// Check for possible duplicates
 				usz max_overdraw_ratio = u32{ umax };
 				usz max_safe_sections = u32{ umax };
@@ -2852,6 +2886,7 @@ namespace rsx
 						m_rtts.check_for_duplicates(overlapping_fbos);
 					}
 				}
+#endif
 
 				// Optionally disallow caching if resource is being written to as it is being read from
 				for (const auto& section : overlapping_fbos)

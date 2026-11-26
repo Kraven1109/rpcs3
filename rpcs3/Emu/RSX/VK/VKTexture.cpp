@@ -1348,9 +1348,8 @@ namespace vk
 					range_ptr += op.second;
 				}
 			}
-			else
+			else if (!buffer_copies.empty())
 			{
-				ensure(!buffer_copies.empty());
 				vkCmdCopyBuffer(cmd2, upload_buffer->value, scratch_buf->value, static_cast<u32>(buffer_copies.size()), buffer_copies.data());
 			}
 
