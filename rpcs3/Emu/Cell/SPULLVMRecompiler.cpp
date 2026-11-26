@@ -20,6 +20,7 @@
 #include "util/v128.hpp"
 #include "util/simd.hpp"
 #include "util/sysinfo.hpp"
+#include "util/asm.hpp"
 
 const extern spu_decoder<spu_itype> g_spu_itype;
 const extern spu_decoder<spu_iname> g_spu_iname;
@@ -4873,12 +4874,89 @@ public:
 		return exec_rdch(_spu, SPU_RdInMbox);
 	}
 
+#ifndef RPCS3_DISABLE_FPSW_SPU_IDLE_OPT
+#if defined(ARCH_X64)
+#if defined(_MSC_VER)
+	static void spu_dec_tpause(u32 cycles) noexcept
+#else
+	__attribute__((__target__("waitpkg"))) static void spu_dec_tpause(u32 cycles) noexcept
+#endif
+	{
+		_tpause(0x0, utils::get_tsc() + cycles);
+	}
+#endif
+#endif
+
 	static u32 exec_read_dec(spu_thread* _spu)
 	{
 		const u32 res = _spu->read_dec().first;
 
 		if (res > 1500 && g_cfg.core.spu_loop_detection)
 		{
+#ifndef RPCS3_DISABLE_FPSW_SPU_IDLE_OPT
+			// Preserve ultra-low-latency upstream yield on titles explicitly opting into SPU Reservation Busy Waiting (e.g. uncapped TLOU).
+			if (!g_cfg.core.spu_reservation_busy_waiting_enabled &&
+				g_cfg.video.frame_limit != frame_limit_type::infinite &&
+				g_cfg.video.frame_limit != frame_limit_type::none)
+			{
+				thread_local u64 tl_exit_tsc = 0;
+				thread_local u64 tl_spin_start_tsc = 0;
+				thread_local u32 tl_last_dec = 0;
+				thread_local u32 tl_streak = 0;
+
+				const u64 entry_tsc = utils::get_tsc();
+				const u64 work_tsc = entry_tsc - tl_exit_tsc;
+
+				// Measure pure guest work between calls (from previous exit to this entry).
+				// Tight decrementer polling loops (e.g. Frostbite 3) do <3us (<8000 TSC) of guest work per poll.
+				if (work_tsc <= 8'000 && res <= tl_last_dec)
+				{
+					if (tl_streak < 256)
+					{
+						++tl_streak;
+					}
+				}
+				else
+				{
+					tl_streak = 1;
+					tl_spin_start_tsc = entry_tsc;
+				}
+				tl_last_dec = res;
+
+				const u64 tsc_freq = utils::get_tsc_freq();
+				// ~500us threshold: escalate to alertable OS C6/C8 sleep once a thread spins idle continuously.
+				const u64 spin_sleep_thresh_tsc = tsc_freq ? (tsc_freq / 2000u) : 1'350'000u;
+
+				_spu->state += cpu_flag::wait;
+				if (tl_streak <= 2)
+				{
+					std::this_thread::yield();
+				}
+#if defined(ARCH_X64)
+				else if ((entry_tsc - tl_spin_start_tsc) < spin_sleep_thresh_tsc && utils::has_waitpkg())
+				{
+					spu_dec_tpause(10'000u);
+				}
+#endif
+				else if ((entry_tsc - tl_spin_start_tsc) >= spin_sleep_thresh_tsc)
+				{
+					u64 sleep_us = ((entry_tsc - tl_spin_start_tsc) >= spin_sleep_thresh_tsc * 4u) ? 50u : 25u;
+					if (res < 0x80000000u)
+					{
+						// 79.8 MHz PS3 decrementer (~80 ticks/us): keep >=50% safety margin so we never oversleep
+						sleep_us = std::min<u64>(sleep_us, std::max<u64>(15u, static_cast<u64>(res - 1500u) / 160u));
+					}
+					thread_ctrl::wait_for(sleep_us, true);
+				}
+				else
+				{
+					std::this_thread::yield();
+				}
+				static_cast<void>(_spu->test_stopped());
+				tl_exit_tsc = utils::get_tsc();
+				return res;
+			}
+#endif
 			_spu->state += cpu_flag::wait;
 			std::this_thread::yield();
 			static_cast<void>(_spu->test_stopped());

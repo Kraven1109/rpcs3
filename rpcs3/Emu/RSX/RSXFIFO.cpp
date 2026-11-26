@@ -774,6 +774,20 @@ namespace rsx
 				}
 				else
 				{
+#ifndef RPCS3_DISABLE_FPSW_SPU_IDLE_OPT
+					// During long inter-frame FIFO idle (>=2ms, e.g. 30 FPS capped titles), drop RSX core
+					// into 50us OS C6/C8 sleep (0.15% of a 33ms frame) when busy-waiting is disabled.
+					if (!eng_interrupt_mask && !g_cfg.core.spu_reservation_busy_waiting_enabled &&
+						g_cfg.video.frame_limit != frame_limit_type::infinite &&
+						g_cfg.video.frame_limit != frame_limit_type::none &&
+						!zcull_ctrl->has_pending() &&
+						(get_system_time() - performance_counters.FIFO_idle_timestamp) >= 2'000)
+					{
+						thread_ctrl::wait_for(50, false);
+						m_cycles_counter = 0;
+						return;
+					}
+#endif
 					std::this_thread::yield();
 				}
 
