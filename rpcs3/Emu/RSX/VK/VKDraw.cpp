@@ -319,7 +319,22 @@ rsx::flags32_t VKGSRender::load_texture_env()
 		const auto& tex = REGS(m_ctx)->fragment_textures[i];
 		const auto previous_format_class = m_fs_sampler_descriptors[i]->format_class;
 
+#ifndef RPCS3_DISABLE_SCALED_RTT_PREFILTER
+		const u32 eff_dst_w = std::min<u32>(REGS(m_ctx)->surface_clip_width(), REGS(m_ctx)->scissor_width());
+		const u32 eff_dst_h = std::min<u32>(REGS(m_ctx)->surface_clip_height(), REGS(m_ctx)->scissor_height());
+		const bool prefilter_prev = rsx::should_prefilter_scaled_rtt(
+			m_ctx->program.fp_metadata.multi_tap_textures_mask, i, sampler_state,
+			tex.alpha_kill_enabled(), tex.width(), tex.height(), eff_dst_w, eff_dst_h);
+		const bool prefilter_filter_mismatch = fs_sampler_handles[i] && (
+			(prefilter_prev && (fs_sampler_handles[i]->info.minFilter != VK_FILTER_LINEAR || fs_sampler_handles[i]->info.magFilter != VK_FILTER_LINEAR)) ||
+			(!prefilter_prev && ((tex.min_filter() == rsx::texture_minify_filter::nearest && fs_sampler_handles[i]->info.minFilter != VK_FILTER_NEAREST) ||
+			                     (tex.mag_filter() == rsx::texture_magnify_filter::nearest && fs_sampler_handles[i]->info.magFilter != VK_FILTER_NEAREST))));
+#else
+		constexpr bool prefilter_filter_mismatch = false;
+#endif
+
 		if (!m_samplers_dirty &&
+			!prefilter_filter_mismatch &&
 			!(m_ctx->textures.fragment_textures_dirty & (1u << i)) &&
 			check_surface_cache_sampler_valid(sampler_state, tex))
 		{
@@ -353,7 +368,7 @@ rsx::flags32_t VKGSRender::load_texture_env()
 				invalidated_programs |= rsx::fragment_program_state_dirty;
 			}
 
-			if (sampler_state->format_ex)
+			if (sampler_state->format_ex && !prefilter_filter_mismatch)
 			{
 				// Nothing to change, use cached sampler
 				continue;
@@ -471,6 +486,17 @@ rsx::flags32_t VKGSRender::load_texture_env()
 		if (can_sample_linear)
 		{
 			mag_filter = vk::get_mag_filter(tex.mag_filter());
+#ifndef RPCS3_DISABLE_SCALED_RTT_PREFILTER
+			if (rsx::should_prefilter_scaled_rtt(
+				m_ctx->program.fp_metadata.multi_tap_textures_mask, i, sampler_state,
+				tex.alpha_kill_enabled(), tex.width(), tex.height(), eff_dst_w, eff_dst_h))
+			{
+				// Upgrade NEAREST to LINEAR during scaled-RTT prefiltering so ±0.5 scaled-texel
+				// 4-tap fetches form an exact [0.25, 0.5, 0.25] tent filter with zero Nyquist leak.
+				min_filter.filter = VK_FILTER_LINEAR;
+				mag_filter = VK_FILTER_LINEAR;
+			}
+#endif
 		}
 		else
 		{

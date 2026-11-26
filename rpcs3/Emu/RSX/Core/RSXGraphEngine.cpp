@@ -10,6 +10,9 @@
 #include "Emu/RSX/rsx_methods.h"
 #include "Emu/system_config.h"
 
+#include <cstdlib>
+#include <unordered_set>
+
 #include "Emu/RSX/NV47/HW/context_accessors.define.h"
 
 namespace rsx
@@ -1412,6 +1415,51 @@ namespace rsx
 					m_ctx->program.fragment_program.texture_params[i].remap |= (remap_hi << 16u);
 				}
 			}
+
+#ifndef RPCS3_DISABLE_SCALED_RTT_PREFILTER
+			{
+				const u32 eff_dst_w = std::min<u32>(REGS(m_ctx)->surface_clip_width(), REGS(m_ctx)->scissor_width());
+				const u32 eff_dst_h = std::min<u32>(REGS(m_ctx)->surface_clip_height(), REGS(m_ctx)->scissor_height());
+				if (rsx::should_prefilter_scaled_rtt(
+					m_ctx->program.fp_metadata.multi_tap_textures_mask, i, sampler_descriptors[i].get(),
+					tex.alpha_kill_enabled(), tex.width(), tex.height(), eff_dst_w, eff_dst_h))
+				{
+					static const f32 s_prefilter_radius_override = []() -> f32 {
+						const char* env = std::getenv("RPCS3_PREFILTER_RADIUS");
+						return (env && env[0]) ? std::strtof(env, nullptr) : 0.f;
+					}();
+					static const bool s_log_prefilter = []() {
+						const char* env = std::getenv("RPCS3_LOG_PREFILTER_SHADERS");
+						return env && env[0] == '1';
+					}();
+
+					const f32 radius = (s_prefilter_radius_override > 0.f)
+						? s_prefilter_radius_override
+						: (0.25f * sampler_descriptors[i]->rtt_scale_factor);
+					texture_control |= (1u << rsx::texture_control_bits::SCALED_RTT_PREFILTER);
+					m_ctx->program.fragment_program.texture_params[i].scale[2] = radius;
+
+					if (s_log_prefilter)
+					{
+						static std::unordered_set<u64> s_logged_triggers;
+						const u32 fp_addr = m_ctx->program.fragment_program.offset;
+						const u64 key = (static_cast<u64>(fp_addr) << 16) | (static_cast<u64>(i) << 8) | m_ctx->program.fp_metadata.tex_tap_counts[i];
+						if (s_logged_triggers.insert(key).second)
+						{
+							rsx_log.notice("[SCALED_RTT_PREFILTER] fp=0x%08x slot=%u taps=%u tex=%ux%u fmt=0x%x minf=%u magf=%u rtt_scale=%.2f radius=%.3f clamp=%d clip=%ux%u scissor=%u,%u,%ux%u",
+								fp_addr, i, static_cast<u32>(m_ctx->program.fp_metadata.tex_tap_counts[i]),
+								tex.width(), tex.height(), format,
+								static_cast<u32>(tex.min_filter()), static_cast<u32>(tex.mag_filter()),
+								sampler_descriptors[i]->rtt_scale_factor, radius,
+								sampler_descriptors[i]->texcoord_xform.clamp ? 1 : 0,
+								REGS(m_ctx)->surface_clip_width(), REGS(m_ctx)->surface_clip_height(),
+								REGS(m_ctx)->scissor_origin_x(), REGS(m_ctx)->scissor_origin_y(),
+								REGS(m_ctx)->scissor_width(), REGS(m_ctx)->scissor_height());
+						}
+					}
+				}
+			}
+#endif
 
 			m_ctx->program.fragment_program.texture_params[i].control = texture_control;
 		}
