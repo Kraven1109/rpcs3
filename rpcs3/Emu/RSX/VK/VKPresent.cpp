@@ -26,7 +26,22 @@ namespace
 		switch (format)
 		{
 		default:
+#ifndef RPCS3_DISABLE_LOG_SPAM_OPT
+		{
+			static atomic_t<u64> s_logged_mask{ 0 };
+			const u64 bit = 1ull << (format < 63 ? format : 63);
+			if ((s_logged_mask.fetch_or(bit) & bit) == 0)
+			{
+				rsx_log.error("Unhandled video output format 0x%x (suppressing further identical messages)", static_cast<s32>(format));
+			}
+			else
+			{
+				rsx_log.trace("Unhandled video output format 0x%x", static_cast<s32>(format));
+			}
+		}
+#else
 			rsx_log.error("Unhandled video output format 0x%x", static_cast<s32>(format));
+#endif
 			[[fallthrough]];
 		case CELL_VIDEO_OUT_BUFFER_COLOR_FORMAT_X8R8G8B8:
 			return VK_FORMAT_B8G8R8A8_UNORM;
