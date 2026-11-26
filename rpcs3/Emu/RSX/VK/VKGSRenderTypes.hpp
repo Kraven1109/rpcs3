@@ -253,6 +253,116 @@ namespace vk
 
 	struct flush_request_task
 	{
+#ifndef RPCS3_DISABLE_RSX_VK_ADAPTIVE_WAIT_OPT
+		atomic_t<u32> pending_state{ 0 };  //Flush request status; non-zero if rsx::thread is yet to service this request
+		atomic_t<int> num_waiters{ 0 };    //Number of threads waiting for this request to be serviced
+		mutable atomic_t<u32> producer_sleepers{ 0 };
+		mutable atomic_t<u32> consumer_sleepers{ 0 };
+		bool hard_sync = false;
+
+		flush_request_task() = default;
+
+		void post(bool _hard_sync)
+		{
+			hard_sync = (hard_sync || _hard_sync);
+			pending_state.store(1u);
+			num_waiters++;
+		}
+
+		void remove_one()
+		{
+			if (num_waiters.sub_fetch(1) == 0 && consumer_sleepers.load()) [[unlikely]]
+			{
+				num_waiters.notify_all();
+			}
+		}
+
+		void clear_pending_flag()
+		{
+			hard_sync = false;
+			pending_state.store(0u);
+			if (producer_sleepers.load()) [[unlikely]]
+			{
+				pending_state.notify_all();
+			}
+		}
+
+		bool pending() const
+		{
+			return pending_state.load() != 0u;
+		}
+
+		[[gnu::noinline]] void consumer_wait_adaptive() const
+		{
+			for (int i = 0; i < 3; ++i)
+			{
+				const int v = num_waiters.load();
+				if (v == 0) return;
+				utils::spin_on_cacheline_once(num_waiters, v, 50);
+			}
+
+			while (const int v = num_waiters.load())
+			{
+				consumer_sleepers++;
+				if (num_waiters.load() == v)
+				{
+					num_waiters.wait(v);
+				}
+				consumer_sleepers--;
+			}
+		}
+
+		[[gnu::noinline]] void producer_wait_adaptive() const
+		{
+			for (int i = 0; i < 3; ++i)
+			{
+				if (!pending_state.load()) return;
+				utils::spin_on_cacheline_once(pending_state, 1u, 50);
+			}
+
+			while (pending_state.load())
+			{
+				producer_sleepers++;
+				if (pending_state.load())
+				{
+					pending_state.wait(1u);
+				}
+				producer_sleepers--;
+			}
+		}
+
+		void consumer_wait() const
+		{
+			if (!g_cfg.core.spu_reservation_busy_waiting_enabled &&
+				g_cfg.video.frame_limit != frame_limit_type::infinite &&
+				g_cfg.video.frame_limit != frame_limit_type::none)
+			{
+				consumer_wait_adaptive();
+				return;
+			}
+
+			utils::spin_wait(num_waiters, [](auto v)
+			{
+				return v == 0;
+			});
+		}
+
+		void producer_wait() const
+		{
+			if (!g_cfg.core.spu_reservation_busy_waiting_enabled &&
+				g_cfg.video.frame_limit != frame_limit_type::infinite &&
+				g_cfg.video.frame_limit != frame_limit_type::none)
+			{
+				producer_wait_adaptive();
+				return;
+			}
+
+			utils::spin_wait(pending_state, [](auto v)
+			{
+				return v == 0u;
+			});
+		}
+#else
 		atomic_t<bool> pending_state{ false };  //Flush request status; true if rsx::thread is yet to service this request
 		atomic_t<int> num_waiters{ 0 };  //Number of threads waiting for this request to be serviced
 		bool hard_sync = false;
@@ -297,6 +407,7 @@ namespace vk
 				return !v;
 			});
 		}
+#endif
 	};
 
 	struct present_surface_info

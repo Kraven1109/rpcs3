@@ -4,6 +4,7 @@
 
 #include "Emu/RSX/RSXThread.h"
 #include "Emu/system_config.h"
+#include "Utilities/Thread.h"
 
 #include "context_accessors.define.h"
 
@@ -54,6 +55,7 @@ namespace rsx
 				//RSX(ctx)->flush_fifo();
 			}
 
+			const bool is_flip_sema = (addr == ctx->fw.label_addr + 0x10);
 			u64 start = get_system_time();
 			u64 last_check_val = start;
 
@@ -101,6 +103,22 @@ namespace rsx
 				}
 
 				RSX(ctx)->renderer()->on_semaphore_acquire_wait();
+
+#ifndef RPCS3_DISABLE_RSX_VK_ADAPTIVE_WAIT_OPT
+				if (!g_cfg.core.spu_reservation_busy_waiting_enabled &&
+					g_cfg.video.frame_limit != frame_limit_type::infinite &&
+					g_cfg.video.frame_limit != frame_limit_type::none)
+				{
+					const u64 now_us = g_cfg.video.driver_recovery_timeout ? last_check_val : get_system_time();
+					const u64 waited_us = (now_us > start) ? (now_us - start) : 0ull;
+					const u64 sleep_thresh_us = is_flip_sema ? 500ull : 2000ull;
+					if (waited_us >= sleep_thresh_us)
+					{
+						thread_ctrl::wait_for(50, false);
+						continue;
+					}
+				}
+#endif
 
 				// Wait until the value changes or until 100us pass.
 				utils::spin_on_cacheline_once(atomic_sema, sema, 100);
