@@ -7,8 +7,17 @@
 #include "shared.h"
 
 #include "Emu/Cell/timers.hpp"
+#include "Emu/system_config.h"
 
+#include "Utilities/Thread.h"
 #include "util/sysinfo.hpp"
+#if defined(ARCH_X64)
+#ifdef _MSC_VER
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
+#endif
 #include "util/asm.hpp"
 #include "util/logs.hpp"
 
@@ -587,17 +596,30 @@ namespace vk
 		}
 	}
 
+#if defined(ARCH_X64) && !defined(RPCS3_DISABLE_RSX_VK_ADAPTIVE_WAIT_OPT)
+#if defined(_MSC_VER)
+	static inline void vk_evt_tpause_c02(u64 deadline)
+#else
+	__attribute__((target("waitpkg")))
+	static inline void vk_evt_tpause_c02(u64 deadline)
+#endif
+	{
+		_tpause(0, deadline);
+	}
+#endif
+
 	VkResult wait_for_event(event* pEvent, u64 timeout)
 	{
 		// Convert timeout to TSC cycles. Timeout accuracy isn't super-important, only fast response when event is signaled (within 10us if possible)
 		const u64 freq = utils::get_tsc_freq();
-
+		const u64 cycles_per_us = freq / 1'000'000;
 		if (freq)
 		{
-			timeout *= (freq / 1'000'000);
+			timeout *= cycles_per_us;
 		}
 
 		u64 start = 0;
+		u32 spin_count = 0;
 
 		while (true)
 		{
@@ -612,9 +634,10 @@ namespace vk
 				return status;
 			}
 
+			u64 now = 0;
 			if (timeout)
 			{
-				const auto now = freq ? utils::get_tsc() : get_system_time();
+				now = freq ? utils::get_tsc() : get_system_time();
 
 				if (!start)
 				{
@@ -630,7 +653,36 @@ namespace vk
 				}
 			}
 
+#ifndef RPCS3_DISABLE_RSX_VK_ADAPTIVE_WAIT_OPT
+			if (spin_count >= 128 &&
+				!g_cfg.core.spu_reservation_busy_waiting_enabled &&
+				g_cfg.video.frame_limit != frame_limit_type::infinite &&
+				g_cfg.video.frame_limit != frame_limit_type::none)
+			{
+				thread_ctrl::wait_for(50, false);
+				continue;
+			}
+#if defined(ARCH_X64)
+			static const bool s_has_waitpkg = utils::has_waitpkg();
+			if (s_has_waitpkg && cycles_per_us && spin_count >= 32)
+			{
+				const u64 base_tsc = (timeout && freq) ? now : utils::get_tsc();
+				const u64 step_us = (spin_count < 64) ? 2ull : 5ull;
+				vk_evt_tpause_c02(base_tsc + step_us * cycles_per_us);
+			}
+			else
+#endif
+			{
+				utils::pause();
+			}
+
+			if (spin_count < 128)
+			{
+				++spin_count;
+			}
+#else
 			utils::pause();
+#endif
 		}
 	}
 }
