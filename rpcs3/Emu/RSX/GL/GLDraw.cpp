@@ -332,7 +332,19 @@ rsx::flags32_t GLGSRender::load_texture_env()
 		const auto& tex = REGS(m_ctx)->fragment_textures[i];
 		const auto previous_format_class = sampler_state->format_class;
 
+#ifndef RPCS3_DISABLE_SCALED_RTT_PREFILTER
+		const u32 eff_dst_w = std::min<u32>(REGS(m_ctx)->surface_clip_width(), REGS(m_ctx)->scissor_width());
+		const u32 eff_dst_h = std::min<u32>(REGS(m_ctx)->surface_clip_height(), REGS(m_ctx)->scissor_height());
+		const bool prefilter_may_override_nearest =
+			sampler_state->upload_context == rsx::texture_upload_context::framebuffer_storage &&
+			sampler_state->rtt_scale_factor > 1.f &&
+			(tex.min_filter() == rsx::texture_minify_filter::nearest || tex.mag_filter() == rsx::texture_magnify_filter::nearest);
+#else
+		constexpr bool prefilter_may_override_nearest = false;
+#endif
+
 		if (!m_samplers_dirty &&
+			!prefilter_may_override_nearest &&
 			!(m_ctx->textures.fragment_textures_dirty & (1u << i)) &&
 			!res()->texture_cache.test_if_descriptor_expired(cmd, res()->surface_cache, sampler_state, tex))
 		{
@@ -361,7 +373,7 @@ rsx::flags32_t GLGSRender::load_texture_env()
 				invalidated_programs |= rsx::fragment_program_state_dirty;
 			}
 
-			if (sampler_state->format_ex)
+			if (sampler_state->format_ex && !prefilter_may_override_nearest)
 			{
 				// Nothing to change, use cached sampler
 				continue;
@@ -447,6 +459,15 @@ rsx::flags32_t GLGSRender::load_texture_env()
 			m_fs_sampler_states[i].set_parameteri(GL_TEXTURE_MIN_FILTER, adjusted_min_filter);
 			m_fs_sampler_states[i].set_parameteri(GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 		}
+#ifndef RPCS3_DISABLE_SCALED_RTT_PREFILTER
+		else if (rsx::should_prefilter_scaled_rtt(
+			m_ctx->program.fp_metadata.multi_tap_textures_mask, i, sampler_state,
+			tex.alpha_kill_enabled(), tex.width(), tex.height(), eff_dst_w, eff_dst_h))
+		{
+			m_fs_sampler_states[i].set_parameteri(GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+			m_fs_sampler_states[i].set_parameteri(GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		}
+#endif
 	}
 
 	for (u32 textures_ref = m_ctx->program.vp_metadata.referenced_textures_mask, i = 0; textures_ref; textures_ref >>= 1, ++i)

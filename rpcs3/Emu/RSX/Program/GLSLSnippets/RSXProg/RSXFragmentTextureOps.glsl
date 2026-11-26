@@ -90,9 +90,9 @@ vec4 _decode_depth_texel(const in vec4 texel, const in uint flags, const in uint
 #endif
 
 #ifdef _ENABLE_TEX2D
-#define TEX2D(index, coord2) _process_texel(_DEPTH_DECODE(index, texture(TEX_NAME(index), COORD_SCALE2(index, coord2))), TEX_FLAGS(index))
+#define TEX2D(index, coord2) _process_texel(_DEPTH_DECODE(index, _sample_tex2d(TEX_NAME(index), COORD_SCALE2(index, coord2), TEX_PARAM(index))), TEX_FLAGS(index))
 #define TEX2D_BIAS(index, coord2, bias) _process_texel(_DEPTH_DECODE(index, texture(TEX_NAME(index), COORD_SCALE2(index, coord2), bias)), TEX_FLAGS(index))
-#define TEX2D_LOD(index, coord2, lod) _process_texel(_DEPTH_DECODE(index, textureLod(TEX_NAME(index), COORD_SCALE2(index, coord2), lod)), TEX_FLAGS(index))
+#define TEX2D_LOD(index, coord2, lod) _process_texel(_DEPTH_DECODE(index, _sample_tex2d_lod(TEX_NAME(index), COORD_SCALE2(index, coord2), lod, TEX_PARAM(index))), TEX_FLAGS(index))
 #define TEX2D_GRAD(index, coord2, dpdx, dpdy) _process_texel(_DEPTH_DECODE(index, textureGrad(TEX_NAME(index), COORD_SCALE2(index, coord2), dpdx, dpdy)), TEX_FLAGS(index))
 #define TEX2D_PROJ(index, coord4) _process_texel(_DEPTH_DECODE(index, texture(TEX_NAME(index), COORD_PROJ2(index, coord4.xyw))), TEX_FLAGS(index))
 #endif
@@ -154,6 +154,58 @@ vec2 _texcoord_xform(const in vec2 coord, const in sampler_info params)
 	}
 
 	return result;
+}
+
+vec4 _sample_tex2d(sampler2D tex, const in vec2 coord, const in sampler_info params)
+{
+#ifdef _ENABLE_SCALED_RTT_PREFILTER
+	if (_test_bit(params.flags, SCALED_RTT_PREFILTER_BIT))
+	{
+		const vec2 half_step = vec2(params.scale_z) / vec2(textureSize(tex, 0));
+		vec2 c0 = coord - half_step;
+		vec2 c1 = coord + half_step;
+		if (_test_bit(params.flags, CLAMP_COORDS_BIT))
+		{
+			const vec2 cmin = vec2(params.clamp_min_x, params.clamp_min_y);
+			const vec2 cmax = vec2(params.clamp_max_x, params.clamp_max_y);
+			c0 = clamp(c0, cmin, cmax);
+			c1 = clamp(c1, cmin, cmax);
+		}
+		return 0.25 * (
+			texture(tex, vec2(c0.x, c0.y)) +
+			texture(tex, vec2(c1.x, c0.y)) +
+			texture(tex, vec2(c0.x, c1.y)) +
+			texture(tex, vec2(c1.x, c1.y))
+		);
+	}
+#endif
+	return texture(tex, coord);
+}
+
+vec4 _sample_tex2d_lod(sampler2D tex, const in vec2 coord, const in float lod, const in sampler_info params)
+{
+#ifdef _ENABLE_SCALED_RTT_PREFILTER
+	if (_test_bit(params.flags, SCALED_RTT_PREFILTER_BIT))
+	{
+		const vec2 half_step = vec2(params.scale_z) / vec2(textureSize(tex, 0));
+		vec2 c0 = coord - half_step;
+		vec2 c1 = coord + half_step;
+		if (_test_bit(params.flags, CLAMP_COORDS_BIT))
+		{
+			const vec2 cmin = vec2(params.clamp_min_x, params.clamp_min_y);
+			const vec2 cmax = vec2(params.clamp_max_x, params.clamp_max_y);
+			c0 = clamp(c0, cmin, cmax);
+			c1 = clamp(c1, cmin, cmax);
+		}
+		return 0.25 * (
+			textureLod(tex, vec2(c0.x, c0.y), lod) +
+			textureLod(tex, vec2(c1.x, c0.y), lod) +
+			textureLod(tex, vec2(c0.x, c1.y), lod) +
+			textureLod(tex, vec2(c1.x, c1.y), lod)
+		);
+	}
+#endif
+	return textureLod(tex, coord, lod);
 }
 #endif
 
