@@ -5819,7 +5819,17 @@ s64 spu_thread::get_ch_value(u32 ch)
 				val = static_cast<u8>(std::min<u32>(val + 1, u8{umax}));
 			}
 
+#ifndef RPCS3_DISABLE_FPSW_SPU_IDLE_OPT
+			// Respect spu_reservation_busy_waiting_enabled: when disabled (capped/general titles), only spin in C0.2 umwait
+			// if this address previously saw a non-notified write (raddr_busy_wait_addr); otherwise use the 50us OS futex path.
+			const bool allow_checking_spin = g_cfg.core.spu_reservation_busy_waiting_enabled ||
+				g_cfg.video.frame_limit == frame_limit_type::infinite ||
+				g_cfg.video.frame_limit == frame_limit_type::none ||
+				std::find(raddr_busy_wait_addr.begin(), raddr_busy_wait_addr.end(), raddr) != raddr_busy_wait_addr.end();
+			if (allow_checking_spin && !s_is_reservation_data_checking_thread && utils::get_thread_count() >= 12)
+#else
 			if (!s_is_reservation_data_checking_thread && utils::get_thread_count() >= 12)// && std::find(raddr_busy_wait_addr.begin(), raddr_busy_wait_addr.end(), raddr) != raddr_busy_wait_addr.end())
+#endif
 			{
 				if (s_is_reservation_data_checking_thread.compare_and_swap_test(0, 1))
 				{
@@ -5922,7 +5932,14 @@ s64 spu_thread::get_ch_value(u32 ch)
 				}
 			}
 
+#ifndef RPCS3_DISABLE_FPSW_SPU_IDLE_OPT
+			const bool allow_indefinite_check_spin = g_cfg.core.spu_reservation_busy_waiting_enabled ||
+				g_cfg.video.frame_limit == frame_limit_type::infinite ||
+				g_cfg.video.frame_limit == frame_limit_type::none;
+			if (eventstat_busy_waiting_switch == 1 && (allow_indefinite_check_spin || time_since < 800))
+#else
 			if (eventstat_busy_waiting_switch == 1)
+#endif
 			{
 				// Don't be stubborn, force operating sleep if too much time has passed
 				const u64 time_since = get_system_time() - eventstat_evaluate_time;
