@@ -683,6 +683,12 @@ namespace rsx
 		atomic_t<u32> m_texture_copies_ellided_this_frame = { 0 };
 		static const u32 m_predict_max_flushes_per_frame = 50; // Above this number the predictions are disabled
 
+#ifndef RPCS3_DISABLE_ATLAS_WAW_AND_PRUNE_FIX
+		// Negative-cache geometry signatures of overlapping FBO sets already verified duplicate-free
+		std::array<u64, 8> m_clean_dup_sigs{};
+		u32 m_clean_dup_sig_idx = 0;
+#endif
+
 		// Invalidation
 		static const bool invalidation_ignore_unsynchronized = true; // If true, unsynchronized sections don't get forcefully flushed unless they overlap the fault range
 		static const bool invalidation_keep_ro_during_read = true; // If true, RO sections are not invalidated during read faults
@@ -2752,39 +2758,6 @@ namespace rsx
 					}
 				}
 
-#ifndef RPCS3_DISABLE_ATLAS_WAW_AND_PRUNE_FIX
-				if (_pool == 0 && overlapping_fbos.size() > 8)
-				{
-					u32 coverage_size = 0;
-					for (const auto& section : overlapping_fbos)
-					{
-						coverage_size += section.surface->get_native_pitch() * section.surface->template get_surface_height<rsx::surface_metrics::bytes>();
-					}
-
-					if (memory_range.length() > 0 && (coverage_size * 100ull) > (memory_range.length() * 125ull))
-					{
-						m_rtts.check_for_duplicates(overlapping_fbos);
-						overlapping_fbos.erase_if([&](const auto& s)
-						{
-							return m_rtts.get_surface_at(s.base_address) != s.surface;
-						});
-
-						if (overlapping_fbos.empty() && overlapping_locals.empty())
-						{
-							return {};
-						}
-
-						if (!options.prefer_surface_cache && !overlapping_fbos.empty())
-						{
-							if (auto fast_res = fast_fbo_check(); fast_res.validate())
-							{
-								return fast_res;
-							}
-						}
-					}
-				}
-#endif
-
 				auto result = helpers::merge_cache_resources<sampled_image_descriptor>(
 					cmd, overlapping_fbos, overlapping_locals, attr, scale, extended_dimension, remap, _pool);
 
@@ -2844,7 +2817,6 @@ namespace rsx
 					return {};
 				}
 
-#ifdef RPCS3_DISABLE_ATLAS_WAW_AND_PRUNE_FIX
 				// Check for possible duplicates
 				usz max_overdraw_ratio = u32{ umax };
 				usz max_safe_sections = u32{ umax };
@@ -2881,12 +2853,69 @@ namespace rsx
 					if (const auto coverage_ratio = (coverage_size * 100ull) / memory_range.length();
 						coverage_ratio > max_overdraw_ratio)
 					{
+#ifdef RPCS3_DISABLE_ATLAS_WAW_AND_PRUNE_FIX
 						rsx_log.warning("[Performance warning] Texture gather routine encountered too many objects! Operation=%d, Mipmaps=%d, Depth=%d, Sections=%zu, Ratio=%llu%",
 							static_cast<int>(result.external_subresource_desc.op), attr.mipmaps, attr.depth, overlapping_fbos.size(), coverage_ratio);
 						m_rtts.check_for_duplicates(overlapping_fbos);
+#else
+						// Fingerprint the exact surface geometry list; remove_duplicates_* is a pure function of it.
+						// Avoid re-running multi-MB fallback painter scans 500+/sec on legitimately dense overlapping pools (e.g. RE6).
+						u64 fbo_sig = (u64{ memory_range.start } << 32) | memory_range.length();
+						fbo_sig = (fbo_sig * 1315423911ull) ^ overlapping_fbos.size();
+						for (const auto& s : overlapping_fbos)
+						{
+							const auto r = s.surface->get_memory_range();
+							const u64 geom = (u64{ s.base_address } << 32) ^ (u64{ r.start } << 16) ^ r.end ^
+								(u64{ s.surface->template get_surface_width<rsx::surface_metrics::bytes>() } << 48) ^
+								(u64{ s.surface->get_rsx_pitch() } << 24) ^
+								s.surface->template get_surface_height<rsx::surface_metrics::samples>();
+							fbo_sig = (fbo_sig * 1315423911ull) ^ geom;
+						}
+						if (fbo_sig == 0) fbo_sig = 1;
+
+						bool already_clean = false;
+						for (const u64 cached_sig : m_clean_dup_sigs)
+						{
+							if (cached_sig == fbo_sig)
+							{
+								already_clean = true;
+								break;
+							}
+						}
+
+						if (!already_clean)
+						{
+							const usz prev_count = overlapping_fbos.size();
+							m_rtts.check_for_duplicates(overlapping_fbos);
+							overlapping_fbos.erase_if([&](const auto& s)
+							{
+								return m_rtts.get_surface_at(s.base_address) != s.surface;
+							});
+
+							if (overlapping_fbos.size() == prev_count)
+							{
+								m_clean_dup_sigs[m_clean_dup_sig_idx++ & 7u] = fbo_sig;
+							}
+							else
+							{
+								m_clean_dup_sigs.fill(0);
+								if (overlapping_fbos.empty() && overlapping_locals.empty())
+								{
+									return {};
+								}
+
+								result = helpers::merge_cache_resources<sampled_image_descriptor>(
+									cmd, overlapping_fbos, overlapping_locals, attr, scale, extended_dimension, remap, _pool);
+
+								if (result.external_subresource_desc.sections_to_copy.empty())
+								{
+									return {};
+								}
+							}
+						}
+#endif
 					}
 				}
-#endif
 
 				// Optionally disallow caching if resource is being written to as it is being read from
 				for (const auto& section : overlapping_fbos)
