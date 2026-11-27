@@ -1187,6 +1187,13 @@ namespace rsx
 			return nullptr;
 		}
 
+#ifndef RPCS3_DISABLE_SPARSE_MIPMAP_GATHER_FIX
+		bool overlaps_surface_range(const rsx::address_range32& range) const
+		{
+			return m_render_targets_memory_range.overlaps(range) || m_depth_stencil_memory_range.overlaps(range);
+		}
+#endif
+
 		// Workaround to handle overlapping surfaces with differing pitch
 		// For a surface region defined by range [address, length] and pitch, we return the max length we can write without clobbering a surface of different pitch.
 		// TODO: Re-evaluate usefulness once pitch-conversion work is completed.
