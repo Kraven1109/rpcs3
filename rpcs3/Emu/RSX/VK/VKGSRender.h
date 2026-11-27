@@ -343,6 +343,9 @@ protected:
 
 	bool on_access_violation(rsx::context* ctx, u32 address, bool is_writing) override;
 	void on_invalidate_memory_range(rsx::context* ctx, const utils::address_range32 &range, rsx::invalidation_cause cause) override;
+#ifndef RPCS3_DISABLE_SAVESTATE_SURFACE_FLUSH
+	void on_flush_guest_data(rsx::context* ctx) override;
+#endif
 	void on_unmap_memory_range(const utils::address_range32& range) override;
 	void on_semaphore_acquire_wait() override;
 };

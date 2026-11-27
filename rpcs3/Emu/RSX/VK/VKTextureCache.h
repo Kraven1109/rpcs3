@@ -107,7 +107,11 @@ namespace vk
 
 			if (surface->is_depth_surface())
 			{
+#ifndef RPCS3_DISABLE_SAVESTATE_SURFACE_FLUSH
+				gcm_format = (surface->get_surface_depth_format() == rsx::surface_depth_format::z16) ? CELL_GCM_TEXTURE_DEPTH16 : CELL_GCM_TEXTURE_DEPTH24_D8;
+#else
 				gcm_format = (surface->get_surface_depth_format() != rsx::surface_depth_format::z16) ? CELL_GCM_TEXTURE_DEPTH16 : CELL_GCM_TEXTURE_DEPTH24_D8;
+#endif
 				swap_bytes = true;
 			}
 			else

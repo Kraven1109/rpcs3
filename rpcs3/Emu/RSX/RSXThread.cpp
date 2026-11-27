@@ -1437,8 +1437,12 @@ namespace rsx
 
 	void thread::flush_guest_data(context* ctx)
 	{
+#ifndef RPCS3_DISABLE_SAVESTATE_SURFACE_FLUSH
+		m_renderer->on_flush_guest_data(ctx);
+#else
 		// FIXME: This isn't quite right. We're supposed to request a surface cache global flush
 		m_renderer->on_invalidate_memory_range(ctx, utils::address_range32::start_end(0, umax), invalidation_cause::read);
+#endif
 	}
 
 	void thread::flush_guest_data()

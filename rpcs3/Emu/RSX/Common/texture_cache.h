@@ -2161,6 +2161,78 @@ namespace rsx
 			return invalidate_range_impl_base(cmd, range, cause, on_data_transfer_completed, std::forward<Args>(extras)...);
 		}
 
+#ifndef RPCS3_DISABLE_SAVESTATE_SURFACE_FLUSH
+		template <typename surface_store_type>
+		void flush_all_guest_data(commandbuffer_type& cmd, surface_store_type& surface_cache)
+		{
+			const auto surfaces = surface_cache.collect_flushable_surfaces();
+			const auto full_range = address_range32::start_end(0, umax);
+
+			std::lock_guard lock(m_cache_mutex);
+
+			if (!surfaces.empty())
+			{
+				// Snapshot active locked flushable sections so newly-registered older surface_cache
+				// entries cannot supersede or overwrite active FBO/DMA sections.
+				rsx::simple_array<section_storage_type*> pre_existing_flushables;
+				for (auto it = m_storage.range_begin(full_range, locked_range, true); it != m_storage.range_end(); ++it)
+				{
+					auto& tex = *it;
+					if (!tex.is_dirty() && tex.is_flushable())
+					{
+						pre_existing_flushables.push_back(&tex);
+					}
+				}
+
+				if (pre_existing_flushables.size() > 1)
+				{
+					std::sort(pre_existing_flushables.begin(), pre_existing_flushables.end(), FN(x->last_write_tag < y->last_write_tag));
+				}
+
+				for (auto* surface : surfaces)
+				{
+					const auto range = surface->get_memory_range();
+
+					bool already_tracked = false;
+					for (const auto* existing : pre_existing_flushables)
+					{
+						if (existing->matches(range) || existing->get_section_base() == range.start)
+						{
+							already_tracked = true;
+							break;
+						}
+					}
+
+					if (already_tracked)
+					{
+						continue;
+					}
+
+					lock_memory_region_impl(
+						cmd, surface, range, false,
+						surface->template get_surface_width<rsx::surface_metrics::pixels>(),
+						surface->template get_surface_height<rsx::surface_metrics::pixels>(),
+						surface->get_rsx_pitch(),
+						surface);
+				}
+
+				// Keep pre-existing locked flushables ordered after newly-locked surface_cache entries
+				// without clearing flush_exclusions or disturbing predictor state.
+				for (auto* existing : pre_existing_flushables)
+				{
+					existing->last_write_tag = m_cache_update_tag;
+					update_cache_tag();
+				}
+			}
+
+			if (no_access_range.valid())
+			{
+				auto data = invalidate_range_impl_base(cmd, full_range, invalidation_cause::read);
+				AUDIT(data.empty());
+			}
+		}
+#endif
+
 		template <typename ...Args>
 		bool flush_all(commandbuffer_type& cmd, thrashed_set& data, std::function<void()> on_data_transfer_completed = {}, Args&&... extras)
 		{
