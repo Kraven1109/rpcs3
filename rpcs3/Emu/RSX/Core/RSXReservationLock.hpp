@@ -11,6 +11,7 @@ namespace rsx
 	{
 		u32 addr = 0;
 		u32 length = 0;
+		bool enabled = false;
 
 		inline void lock_range(u32 addr, u32 length)
 		{
@@ -26,18 +27,25 @@ namespace rsx
 	public:
 		reservation_lock(u32 addr, u32 length)
 		{
-			if (g_cfg.core.rsx_accurate_res_access &&
-				addr < constants::local_mem_base)
+			if (g_cfg.core.rsx_accurate_res_access)
 			{
-				lock_range(addr, length);
+				enabled = true;
+				if (addr < constants::local_mem_base)
+				{
+					lock_range(addr, length);
+				}
 			}
 		}
 
 		reservation_lock(u32 addr, u32 length, bool setting)
 		{
-			if (setting && addr < constants::local_mem_base)
+			if (setting)
 			{
-				lock_range(addr, length);
+				enabled = true;
+				if (addr < constants::local_mem_base)
+				{
+					lock_range(addr, length);
+				}
 			}
 		}
 
@@ -49,6 +57,8 @@ namespace rsx
 			{
 				return;
 			}
+
+			enabled = true;
 
 			const auto range1 = utils::address_range32::start_length(dst_addr, dst_length);
 			const auto range2 = utils::address_range32::start_length(src_addr, src_length);
@@ -74,9 +84,23 @@ namespace rsx
 		template <typename T = void>
 		void update_if_enabled(u32 addr, u32 _length, const std::add_pointer_t<T>& lock_release = std::add_pointer_t<void>{})
 		{
+			if (!enabled)
+			{
+				return;
+			}
+
 			if (!length)
 			{
-				unlock();
+				if (addr < constants::local_mem_base && get_current_renderer()->iomap_table.is_mapped(addr, _length)) [[unlikely]]
+				{
+					if constexpr (!std::is_void_v<T>)
+					{
+						// See SPUThread.cpp
+						lock_release->release(0);
+					}
+
+					lock_range(addr, _length);
+				}
 				return;
 			}
 
@@ -97,7 +121,10 @@ namespace rsx
 			}
 
 			unlock();
-			lock_range(addr, _length);
+			if (addr < constants::local_mem_base)
+			{
+				lock_range(addr, _length);
+			}
 		}
 
 		void unlock(bool destructor = false)

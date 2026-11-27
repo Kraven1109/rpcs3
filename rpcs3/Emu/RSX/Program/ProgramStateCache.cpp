@@ -491,6 +491,15 @@ fragment_program_utils::fragment_program_metadata fragment_program_utils::analys
 		case RSX_FP_OPCODE_TXL:
 			result.referenced_textures_mask |= (1 << d0.tex_num);
 			result.bx2_texture_reads_mask |= ((d0.exp_tex ? 1u : 0u) << d0.tex_num);
+#ifndef RPCS3_DISABLE_SCALED_RTT_PREFILTER
+			if (result.tex_tap_counts[d0.tex_num] < 255)
+			{
+				if (++result.tex_tap_counts[d0.tex_num] >= 4)
+				{
+					result.multi_tap_textures_mask |= (1u << d0.tex_num);
+				}
+			}
+#endif
 			break;
 		case RSX_FP_OPCODE_PK4:
 		case RSX_FP_OPCODE_UP4:

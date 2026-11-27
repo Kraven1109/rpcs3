@@ -2251,7 +2251,7 @@ bool lv2_obj::wait_timeout(u64 usec, ppu_thread* cpu, bool scale, bool is_usleep
 
 				if (utils::has_waitpkg())
 				{
-					__tpause(us_in_tsc_clocks, 0x1);
+					__tpause(us_in_tsc_clocks, 0x0);
 				}
 				else
 				{
@@ -2345,13 +2345,15 @@ void lv2_obj::notify_all() noexcept
 		range_lock = static_cast<spu_thread*>(cpu)->range_lock;
 	}
 
+	bool any_notifies = false;
+
 	for (usz i = 0, checked = 0; checked < 4 && i < total_waiters; i++)
 	{
 		auto& waiter = spu_thread::g_spu_waiters_by_value[(i + cpu->id) % total_waiters];
 		const u64 value = waiter.load();
 		u32 raddr = static_cast<u32>(value) & -128;
 
-		if (vm::check_addr(raddr))
+		if (raddr && vm::check_addr(raddr))
 		{
 			if (((raddr >> 28) < 2 || (raddr >> 28) == 0xd))
 			{
@@ -2373,6 +2375,7 @@ void lv2_obj::notify_all() noexcept
 					{
 						notifies[i] = raddr;
 						notifies_time[i] = vm::reservation_acquire(raddr);
+						any_notifies = true;
 					}
 				}
 
@@ -2402,6 +2405,7 @@ void lv2_obj::notify_all() noexcept
 				{
 					notifies[i] = raddr;
 					notifies_time[i] = vm::reservation_acquire(raddr);
+					any_notifies = true;
 				}
 			}
 		}
@@ -2412,13 +2416,16 @@ void lv2_obj::notify_all() noexcept
 		vm::free_range_lock(range_lock);
 	}
 
-	for (u32 i = 0; i < total_waiters; i++)
+	if (any_notifies)
 	{
-		if (notifies[i])
+		for (u32 i = 0; i < total_waiters; i++)
 		{
-			// Cover all waiters for an address
-			vm::reservation_notifier_notify(notifies[i], notifies_time[i]);
-			vm::reservation_notifier_notify(notifies[i], notifies_time[i] - 128);
+			if (notifies[i])
+			{
+				// Cover all waiters for an address
+				vm::reservation_notifier_notify(notifies[i], notifies_time[i]);
+				vm::reservation_notifier_notify(notifies[i], notifies_time[i] - 128);
+			}
 		}
 	}
 }

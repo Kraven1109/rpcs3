@@ -470,7 +470,10 @@ namespace glsl
 				{ "FORMAT_FEATURE_SIGNED_BIT", rsx::texture_control_bits::FF_SIGNED_BIT },
 				{ "FORMAT_FEATURE_GAMMA_BIT",  rsx::texture_control_bits::FF_GAMMA_BIT },
 				{ "FORMAT_FEATURE_BIASED_RENORMALIZATION_BIT", rsx::texture_control_bits::FF_BIASED_RENORM_BIT },
-				{ "FORMAT_FEATURE_16BIT_CHANNELS_BIT", rsx::texture_control_bits::FF_16BIT_CHANNELS_BIT }
+				{ "FORMAT_FEATURE_16BIT_CHANNELS_BIT", rsx::texture_control_bits::FF_16BIT_CHANNELS_BIT },
+#ifndef RPCS3_DISABLE_SCALED_RTT_PREFILTER
+				{ "SCALED_RTT_PREFILTER_BIT", rsx::texture_control_bits::SCALED_RTT_PREFILTER }
+#endif
 			});
 
 			if (props.require_texture_expand)
@@ -492,6 +495,9 @@ namespace glsl
 			{
 				enabled_options.push_back("_ENABLE_TEX1D");
 			}
+#ifndef RPCS3_DISABLE_SCALED_RTT_PREFILTER
+			enabled_options.push_back("_ENABLE_SCALED_RTT_PREFILTER");
+#endif
 
 			if (props.require_tex2D_ops)
 			{

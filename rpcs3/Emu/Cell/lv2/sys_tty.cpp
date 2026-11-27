@@ -95,7 +95,11 @@ error_code sys_tty_write([[maybe_unused]] ppu_thread& ppu, s32 ch, vm::cptr<char
 {
 	ppu.state += cpu_flag::wait;
 
+#ifndef RPCS3_DISABLE_LOG_SPAM_OPT
+	sys_tty.trace("sys_tty_write(ch=%d, buf=*0x%x, len=%d, pwritelen=*0x%x)", ch, buf, len, pwritelen);
+#else
 	sys_tty.notice("sys_tty_write(ch=%d, buf=*0x%x, len=%d, pwritelen=*0x%x)", ch, buf, len, pwritelen);
+#endif
 
 	std::string msg;
 
@@ -129,7 +133,11 @@ error_code sys_tty_write([[maybe_unused]] ppu_thread& ppu, s32 ch, vm::cptr<char
 
 	sample = {}; // Remove reference to string
 
+#ifndef RPCS3_DISABLE_LOG_SPAM_OPT
+	if ((warning || g_cfg.core.debug_console_mode) && msg.size() >= 2u && [&]()
+#else
 	if (msg.size() >= 2u && [&]()
+#endif
 	{
 		static thread_local u64 last_write = 0;
 
@@ -164,6 +172,13 @@ error_code sys_tty_write([[maybe_unused]] ppu_thread& ppu, s32 ch, vm::cptr<char
 	{
 		if (!msg.empty())
 		{
+#ifndef RPCS3_DISABLE_LOG_SPAM_OPT
+			const bool trivial_noise = !warning && !g_cfg.core.debug_console_mode &&
+				std::all_of(msg.begin(), msg.end(), [](unsigned char c) { return c <= ' ' || c == '-' || c == '=' || c == '*'; });
+			const auto& tty_out = warning ? sys_tty.warning : (trivial_noise ? sys_tty.trace : sys_tty.notice);
+#else
+			const auto& tty_out = warning ? sys_tty.warning : sys_tty.notice;
+#endif
 			if (msg.ends_with("\n"))
 			{
 				// Avoid logging trailing newlines, log them verbosely instead
@@ -171,16 +186,16 @@ error_code sys_tty_write([[maybe_unused]] ppu_thread& ppu, s32 ch, vm::cptr<char
 
 				if (msg.size() - 1 == msg_clear.size())
 				{
-					(warning ? sys_tty.warning : sys_tty.notice)(u8"sys_tty_write(): “%s“ << endl", msg_clear);
+					tty_out(u8"sys_tty_write(): “%s“ << endl", msg_clear);
 				}
 				else
 				{
-					(warning ? sys_tty.warning : sys_tty.notice)(u8"sys_tty_write(): “%s” << endl(%u)", msg_clear, msg.size() - msg_clear.size());
+					tty_out(u8"sys_tty_write(): “%s” << endl(%u)", msg_clear, msg.size() - msg_clear.size());
 				}
 			}
 			else
 			{
-				(warning ? sys_tty.warning : sys_tty.notice)(u8"sys_tty_write(): “%s”", msg);
+				tty_out(u8"sys_tty_write(): “%s”", msg);
 			}
 
 			if (g_tty)

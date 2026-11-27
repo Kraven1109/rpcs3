@@ -333,9 +333,8 @@ static FORCE_INLINE void mov_rdata_avx(__m256i* dst, const __m256i* src)
 }
 #endif
 
-// Check if only a single 16-bytes block has changed
-// Returning its position, or -1 if that is not the situation
-static inline usz scan16_rdata(const decltype(spu_thread::rdata)& _lhs, const decltype(spu_thread::rdata)& _rhs)
+// Return bitmask of changed 16-byte slices between _lhs and _rhs
+static inline u32 scan16_mask_rdata(const decltype(spu_thread::rdata)& _lhs, const decltype(spu_thread::rdata)& _rhs)
 {
 	const auto lhs = reinterpret_cast<const v128*>(_lhs);
 	const auto rhs = reinterpret_cast<const v128*>(_rhs);
@@ -351,6 +350,15 @@ static inline usz scan16_rdata(const decltype(spu_thread::rdata)& _lhs, const de
 
 		mask |= ((a << 0) + (b << 1) + (c << 2) + (d << 3)) << i;
 	}
+
+	return mask;
+}
+
+// Check if only a single 16-bytes block has changed
+// Returning its position, or -1 if that is not the situation
+static inline usz scan16_rdata(const decltype(spu_thread::rdata)& _lhs, const decltype(spu_thread::rdata)& _rhs)
+{
+	const u32 mask = scan16_mask_rdata(_lhs, _rhs);
 
 	if (mask && (mask & (mask - 1)) == 0)
 	{
@@ -509,10 +517,23 @@ mwaitx_func static void __mwaitx(u32 cycles, u32 cstate, const void* cline, cons
 }
 
 // First bit indicates cstate, 0x0 for C.02 state (lower power) or 0x1 for C.01 state (higher power)
-waitpkg_func static void __tpause(u32 cycles, u32 cstate)
+[[maybe_unused]] waitpkg_func static void __tpause(u32 cycles, u32 cstate)
 {
 	const u64 tsc = utils::get_tsc() + cycles;
 	_tpause(cstate, tsc);
+}
+
+// Intel WAITPKG hardware cacheline monitor & wait
+template <typename T, typename... Args>
+waitpkg_func static void __umwait(u32 cycles, u32 cstate, const void* cline, const Args&... args)
+{
+	_umonitor(const_cast<void*>(cline));
+
+	if (T::needs_wait(args...))
+	{
+		const u64 tsc = utils::get_tsc() + cycles;
+		_umwait(cstate, tsc);
+	}
 }
 #endif
 
@@ -2056,7 +2077,10 @@ void spu_thread::push_snr(u32 number, u32 value)
 
 	// Configueable SPU head start (compnesation)
 	// SPU wakes up immediately on realhW and is faster than PPU
-	thread_ctrl::wait_for_accurate(g_cfg.core.spu_mmio_delay_enabled ? +g_cfg.core.spu_mmio_delay : 3);
+	if (g_cfg.core.spu_mmio_delay_enabled)
+	{
+		thread_ctrl::wait_for_accurate(+g_cfg.core.spu_mmio_delay);
+	}
 }
 
 void spu_thread::push_in_mbox(u32 value)
@@ -2119,7 +2143,10 @@ void spu_thread::push_in_mbox(u32 value)
 
 	// Configurable SPU head start (compensation)
 	// SPU wakes up immediately on realhw and is faster than PPU
-	thread_ctrl::wait_for_accurate(g_cfg.core.spu_mmio_delay_enabled ? +g_cfg.core.spu_mmio_delay : 3);
+	if (g_cfg.core.spu_mmio_delay_enabled)
+	{
+		thread_ctrl::wait_for_accurate(+g_cfg.core.spu_mmio_delay);
+	}
 }
 
 void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8* ls)
@@ -3541,7 +3568,8 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 		static const auto cast_as = [](void* ptr, usz pos){ return reinterpret_cast<u128*>(ptr) + pos; };
 		static const auto cast_as_const = [](const void* ptr, usz pos){ return reinterpret_cast<const u128*>(ptr) + pos; };
 
-		const usz diff16_pos = scan16_rdata(to_write, rdata);
+		const u32 diff16_mask = scan16_mask_rdata(to_write, rdata);
+		const usz diff16_pos = (diff16_mask && (diff16_mask & (diff16_mask - 1)) == 0) ? static_cast<usz>(std::countr_zero(diff16_mask)) : usz{umax};
 
 		auto [_oldd, _ok] = res.fetch_op([&](u64& r)
 		{
@@ -3577,7 +3605,7 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 		auto& super_data = *vm::get_super_ptr<spu_rdata_t>(addr);
 		const bool success = [&]()
 		{
-			if (!g_cfg.core.spu_accurate_reservations && diff16_pos != umax)
+			if ((!g_cfg.core.spu_accurate_reservations || addr - spurs_addr > 0x80) && diff16_pos != umax)
 			{
 				vm::range_lock<128>(range_lock, addr, 128);
 				const bool ok = cmp_rdata(rdata, super_data) && atomic_storage<u128>::compare_exchange(*cast_as(super_data, diff16_pos), *cast_as(rdata, diff16_pos), *cast_as_const(to_write, diff16_pos));
@@ -4510,20 +4538,20 @@ bool spu_thread::process_mfc_cmd()
 #if defined(ARCH_X64)
 								if (utils::has_um_wait())
 								{
+									struct check_wait_t
+									{
+										static FORCE_INLINE bool needs_wait(u64 rtime, const atomic_t<u64>& mem_rtime) noexcept
+										{
+											return rtime == mem_rtime;
+										}
+									};
+
 									if (utils::has_waitpkg())
 									{
-										__tpause(std::min<u32>(getllar_spin_count, 10) * 500, 0x1);
+										__umwait<check_wait_t>(std::min<u32>(getllar_spin_count, 10) * 500, 0x0, std::addressof(res), +rtime, res);
 									}
 									else
 									{
-										struct check_wait_t
-										{
-											static FORCE_INLINE bool needs_wait(u64 rtime, const atomic_t<u64>& mem_rtime) noexcept
-											{
-												return rtime == mem_rtime;
-											}
-										};
-
 										// Provide the first X64 cache line of the reservation to be tracked
 										__mwaitx<check_wait_t>(std::min<u32>(getllar_spin_count, 17) * 500, 0xf0, std::addressof(data), +rtime, vm::reservation_acquire(addr));
 									}
@@ -5819,7 +5847,17 @@ s64 spu_thread::get_ch_value(u32 ch)
 				val = static_cast<u8>(std::min<u32>(val + 1, u8{umax}));
 			}
 
+#ifndef RPCS3_DISABLE_FPSW_SPU_IDLE_OPT
+			// Respect spu_reservation_busy_waiting_enabled: when disabled (capped/general titles), only spin in C0.2 umwait
+			// if this address previously saw a non-notified write (raddr_busy_wait_addr); otherwise use the 50us OS futex path.
+			const bool allow_checking_spin = g_cfg.core.spu_reservation_busy_waiting_enabled ||
+				g_cfg.video.frame_limit == frame_limit_type::infinite ||
+				g_cfg.video.frame_limit == frame_limit_type::none ||
+				std::find(raddr_busy_wait_addr.begin(), raddr_busy_wait_addr.end(), raddr) != raddr_busy_wait_addr.end();
+			if (allow_checking_spin && !s_is_reservation_data_checking_thread && utils::get_thread_count() >= 12)
+#else
 			if (!s_is_reservation_data_checking_thread && utils::get_thread_count() >= 12)// && std::find(raddr_busy_wait_addr.begin(), raddr_busy_wait_addr.end(), raddr) != raddr_busy_wait_addr.end())
+#endif
 			{
 				if (s_is_reservation_data_checking_thread.compare_and_swap_test(0, 1))
 				{
@@ -5922,36 +5960,47 @@ s64 spu_thread::get_ch_value(u32 ch)
 				}
 			}
 
-			if (eventstat_busy_waiting_switch == 1)
+			const u64 time_since = eventstat_busy_waiting_switch == 1 ? (get_system_time() - eventstat_evaluate_time) : 0;
+
+			if (eventstat_busy_waiting_switch == 1 && !is_reservation_data_checking_thread && time_since >= (utils::get_thread_count() >= 9 ? 50'000 : 3000))
 			{
-				// Don't be stubborn, force operating sleep if too much time has passed
-				const u64 time_since = get_system_time() - eventstat_evaluate_time;
+				spu_log.trace("SPU RdEventStat wait for 0x%x failed", raddr);
+				history.front() = 2;
+				eventstat_busy_waiting_switch = 0;
+				continue;
+			}
 
-				if (!is_reservation_data_checking_thread && time_since >= (utils::get_thread_count() >= 9 ? 50'000 : 3000))
-				{
-					spu_log.trace("SPU RdEventStat wait for 0x%x failed", raddr);
-					history.front() = 2;
-					eventstat_busy_waiting_switch = 0;
-					continue;
-				}
-
+#ifndef RPCS3_DISABLE_FPSW_SPU_IDLE_OPT
+			const bool allow_indefinite_check_spin = is_reservation_data_checking_thread &&
+				(g_cfg.core.spu_reservation_busy_waiting_enabled ||
+				 g_cfg.video.frame_limit == frame_limit_type::infinite ||
+				 g_cfg.video.frame_limit == frame_limit_type::none);
+			if (eventstat_busy_waiting_switch == 1 && (allow_indefinite_check_spin || time_since < 800))
+#else
+			if (eventstat_busy_waiting_switch == 1 && (is_reservation_data_checking_thread || time_since < 800))
+#endif
+			{
 #if defined(ARCH_X64)
 				if (utils::has_um_wait())
 				{
+					struct check_wait_t
+					{
+						static FORCE_INLINE bool needs_wait(u64 rtime, const atomic_t<u64>& mem_rtime) noexcept
+						{
+							return rtime == mem_rtime;
+						}
+					};
+
 					if (utils::has_waitpkg())
 					{
-						__tpause(static_cast<u32>(std::min<u64>(eventstat_spin_count, 10) * 500), 0x1);
+						auto& res_line = vm::reservation_acquire(raddr);
+						const u32 wait_cycles = (is_reservation_data_checking_thread && time_since >= 800)
+							? 90'000u
+							: static_cast<u32>(std::min<u64>(eventstat_spin_count + 1, 64) * 500);
+						__umwait<check_wait_t>(wait_cycles, 0x0, std::addressof(res_line), +rtime, res_line);
 					}
 					else
 					{
-						struct check_wait_t
-						{
-							static FORCE_INLINE bool needs_wait(u64 rtime, const atomic_t<u64>& mem_rtime) noexcept
-							{
-								return rtime == mem_rtime;
-							}
-						};
-
 						// Provide the first X64 cache line of the reservation to be tracked
 						__mwaitx<check_wait_t>(static_cast<u32>(std::min<u64>(eventstat_spin_count, 17) * 500), 0xf0, std::addressof(*resrv_mem), +rtime, vm::reservation_acquire(raddr));
 					}
@@ -5963,7 +6012,10 @@ s64 spu_thread::get_ch_value(u32 ch)
 				}
 
 				// Check other reservations in other threads
-				lv2_obj::notify_all();
+				if (eventstat_spin_count == 0 || (eventstat_spin_count & 3) == 0)
+				{
+					lv2_obj::notify_all();
+				}
 
 				eventstat_spin_count++;
 				continue;
@@ -6045,7 +6097,12 @@ s64 spu_thread::get_ch_value(u32 ch)
 						}
 						else if (check_cache_line_waiter())
 						{
-							utils::bless<atomic_t<u32>>(&wait_var->raw().wait_flag)->wait(flag_val, atomic_wait_timeout{50'000});
+#ifndef RPCS3_DISABLE_FPSW_SPU_IDLE_OPT
+							const u64 futex_timeout_ns = (eventstat_busy_waiting_switch == 1 && !is_reservation_data_checking_thread) ? 250'000u : 50'000u;
+							utils::bless<atomic_t<u32>>(&wait_var->raw().wait_flag)->wait(flag_val, atomic_wait_timeout{futex_timeout_ns});
+#else
+							utils::bless<atomic_t<u32>>(&wait_var->raw().wait_flag)->wait(flag_val, atomic_wait_timeout{eventstat_busy_waiting_switch == 1 ? 250'000u : 50'000u});
+#endif
 						}
 
 						vm::reservation_notifier_end_wait(*wait_var);

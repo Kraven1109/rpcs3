@@ -868,7 +868,11 @@ std::string FragmentProgramDecompiler::BuildCode()
 		}
 
 		// Emit debug warning. Useful to diagnose regressions, but should be removed in future.
+#ifndef RPCS3_DISABLE_LOG_SPAM_OPT
+		rsx_log.trace("ROP reads from %s without writing to it. Final value will be gathered.", reg_name);
+#else
 		rsx_log.warning("ROP reads from %s without writing to it. Final value will be gathered.", reg_name);
+#endif
 	}
 
 	if (properties.has_dynamic_register_load)

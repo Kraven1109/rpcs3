@@ -889,6 +889,18 @@
                 </widget>
                </item>
                <item>
+                <widget class="QGroupBox" name="gb_scaledRTTPrefilter">
+                 <property name="title">
+                  <string>Scaled RTT Blur Prefilter</string>
+                 </property>
+                 <layout class="QVBoxLayout" name="gb_scaledRTTPrefilter_layout">
+                  <item>
+                   <widget class="QComboBox" name="scaledRTTPrefilterMode"/>
+                  </item>
+                 </layout>
+                </widget>
+               </item>
+               <item>
                 <spacer name="gpu_tab_layout_middle_spacer">
                  <property name="orientation">
                   <enum>Qt::Orientation::Vertical</enum>

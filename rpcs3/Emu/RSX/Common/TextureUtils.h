@@ -2,9 +2,11 @@
 
 #include "io_buffer.h"
 #include "simple_array.hpp"
+#include "Emu/system_config.h"
 #include "../Utils/color_utils.hpp"
 #include "../RSXTexture.h"
 
+#include <cstdlib>
 #include <vector>
 #include <concepts>
 
@@ -225,10 +227,51 @@ namespace rsx
 		u8 samples = 1;
 		u32 ref_address = 0;
 		u64 surface_cache_tag = 0;
+#ifndef RPCS3_DISABLE_SCALED_RTT_PREFILTER
+		f32 rtt_scale_factor = 1.f;
+#endif
 
 		texcoord_xform_t texcoord_xform;
 		texture_format_ex format_ex;
 	};
+
+#ifndef RPCS3_DISABLE_SCALED_RTT_PREFILTER
+	inline bool should_prefilter_scaled_rtt(
+		u16 multi_tap_textures_mask,
+		u32 slot,
+		const sampled_image_descriptor_base* desc,
+		bool alpha_kill,
+		u32 tex_w,
+		u32 tex_h,
+		u32 eff_dst_w,
+		u32 eff_dst_h)
+	{
+		static const bool s_prefilter_disabled = []() {
+			const char* env = std::getenv("RPCS3_NO_PREFILTER");
+			return env && env[0] == '1';
+		}();
+		if (g_cfg.video.scaled_rtt_prefilter != scaled_rtt_prefilter_mode::_auto || s_prefilter_disabled || !desc)
+		{
+			return false;
+		}
+		if (!(multi_tap_textures_mask & (1u << slot)) ||
+			desc->upload_context != rsx::texture_upload_context::framebuffer_storage ||
+			desc->rtt_scale_factor <= 1.f ||
+			desc->image_type != rsx::texture_dimension_extended::texture_dimension_2d ||
+			desc->format_class != RSX_FORMAT_CLASS_COLOR ||
+			desc->samples != 1 ||
+			alpha_kill ||
+			(desc->format_ex.texel_remap_control & rsx::texture_control_bits::SEXT_MASK) != 0)
+		{
+			return false;
+		}
+		// Exclude full-resolution 1:1 backbuffer filters (e.g. FXAA/MLAA on 1280x720 or 1024x600)
+		// so only sub-resolution passes (bloom/blur/downsample/DoF/atlas tiles) are prefiltered.
+		const bool is_subres_src = (tex_w <= 640u && tex_h <= 512u);
+		const bool is_subres_dst = (eff_dst_w <= 640u && eff_dst_h <= 512u);
+		return is_subres_src || is_subres_dst;
+	}
+#endif
 
 	struct typeless_xfer
 	{

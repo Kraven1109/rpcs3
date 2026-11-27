@@ -112,6 +112,7 @@ enum class emu_settings_type
 	AllowHostGPULabels,
 	DisableMSLFastMath,
 	OutputScalingMode,
+	ScaledRTTPrefilter,
 	ForceHwMSAAResolve,
 	DisableAsyncHostMM,
 	UseReBAR,

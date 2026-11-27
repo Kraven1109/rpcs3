@@ -57,6 +57,10 @@ namespace program_hash_util
 			u32 program_constants_buffer_length;
 			u16 referenced_textures_mask;
 			u16 bx2_texture_reads_mask;
+#ifndef RPCS3_DISABLE_SCALED_RTT_PREFILTER
+			u16 multi_tap_textures_mask = 0;
+			std::array<u8, 16> tex_tap_counts{};
+#endif
 
 			bool has_pack_instructions;
 			bool has_branch_instructions;

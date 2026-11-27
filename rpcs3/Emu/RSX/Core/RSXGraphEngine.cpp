@@ -9,6 +9,12 @@
 #include "Emu/RSX/RSXThread.h"
 #include "Emu/RSX/rsx_methods.h"
 #include "Emu/system_config.h"
+#include "util/asm.hpp"
+
+#include <chrono>
+#include <cstdlib>
+#include <thread>
+#include <unordered_set>
 
 #include "Emu/RSX/NV47/HW/context_accessors.define.h"
 
@@ -558,6 +564,23 @@ namespace rsx
 			{
 				layout.zeta_address += (layout.actual_zeta_pitch * window_offset_y) + (depth_texel_size * window_offset_x);
 			}
+
+#ifndef RPCS3_DISABLE_WINDOW_OFFSET_CLIP_FIX
+			// When a title sets both surface clip origin and window offset to the same sub-region
+			// start (e.g. MT Framework / RE6 mip-pyramid FBOs: clip_origin_y == window_offset_y with
+			// clip_height encoding y_end = origin_y + h), rebase layout dimensions to (end - offset)
+			// so the surface does not bleed past its real bounds and stall/alias adjacent textures.
+			const u16 clip_origin_x = REGS(m_ctx)->surface_clip_origin_x();
+			const u16 clip_origin_y = REGS(m_ctx)->surface_clip_origin_y();
+			if (window_offset_x && clip_origin_x == window_offset_x && layout.width > window_offset_x)
+			{
+				layout.width -= window_offset_x;
+			}
+			if (window_offset_y && clip_origin_y == window_offset_y && layout.height > window_offset_y)
+			{
+				layout.height -= window_offset_y;
+			}
+#endif
 		}
 
 		if ((window_clip_width && window_clip_width < layout.width) ||
@@ -997,8 +1020,82 @@ namespace rsx
 		const auto [program_offset, program_location] = REGS(m_ctx)->shader_program_address();
 		const auto prev_textures_reference_mask = m_ctx->program.fp_metadata.referenced_textures_mask;
 
-		auto data_ptr = vm::base(rsx::get_address(m_ctx, program_offset, program_location));
+		const u32 rsx_addr = rsx::get_address(m_ctx, program_offset, program_location);
+		auto data_ptr = vm::base(rsx_addr);
+
+#ifndef DISABLE_RSX_FP_UCODE_RACE_GUARD
+		// Guard against PPU/SPU vs RSX FIFO race where transient leading zeroed ucode
+		// makes analyse_fragment_program() walk off into an unintended or NOP shader.
+		const auto* wp = static_cast<const volatile u32*>(data_ptr);
+		if ((wp[0] | wp[1] | wp[2] | wp[3]) != 0u) [[likely]]
+		{
+			m_ctx->program.fp_metadata = program_hash_util::fragment_program_utils::analyse_fragment_program(data_ptr);
+		}
+		else [[unlikely]]
+		{
+			const auto t_start = std::chrono::steady_clock::now();
+			u32 iter = 0;
+			s64 elapsed_us = 0;
+
+			while ((wp[0] | wp[1] | wp[2] | wp[3]) == 0u)
+			{
+				elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+					std::chrono::steady_clock::now() - t_start).count();
+				if (elapsed_us >= 2000 || RSX(m_ctx)->test_stopped())
+				{
+					break;
+				}
+				if (iter < 32u)
+				{
+					utils::pause();
+				}
+				else
+				{
+					std::this_thread::sleep_for(std::chrono::microseconds(20));
+				}
+				++iter;
+			}
+
+			if ((wp[0] | wp[1] | wp[2] | wp[3]) != 0u)
+			{
+				auto meta = program_hash_util::fragment_program_utils::analyse_fragment_program(data_ptr);
+				for (int pass = 0; pass < 5; ++pass)
+				{
+					if (RSX(m_ctx)->test_stopped())
+					{
+						break;
+					}
+					std::this_thread::sleep_for(std::chrono::microseconds(30));
+					const auto next_meta = program_hash_util::fragment_program_utils::analyse_fragment_program(data_ptr);
+					const bool stable =
+						(next_meta.program_start_offset == meta.program_start_offset) &&
+						(next_meta.program_ucode_length == meta.program_ucode_length) &&
+						(next_meta.is_nop_shader == meta.is_nop_shader);
+					meta = next_meta;
+					if (stable)
+					{
+						break;
+					}
+				}
+
+				elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+					std::chrono::steady_clock::now() - t_start).count();
+				rsx_log.warning("RSX: Recovered from transient zeroed fragment program at 0x%x (offset=0x%x) after %lld us (start=0x%x len=%u)",
+					rsx_addr,
+					program_offset,
+					static_cast<long long>(elapsed_us),
+					static_cast<u32>(meta.program_start_offset),
+					meta.program_ucode_length);
+				m_ctx->program.fp_metadata = meta;
+			}
+			else
+			{
+				m_ctx->program.fp_metadata = program_hash_util::fragment_program_utils::analyse_fragment_program(data_ptr);
+			}
+		}
+#else
 		m_ctx->program.fp_metadata = program_hash_util::fragment_program_utils::analyse_fragment_program(data_ptr);
+#endif
 
 		m_ctx->program.fragment_program.data = (static_cast<u8*>(data_ptr) + m_ctx->program.fp_metadata.program_start_offset);
 		m_ctx->program.fragment_program.offset = program_offset + m_ctx->program.fp_metadata.program_start_offset;
@@ -1412,6 +1509,51 @@ namespace rsx
 					m_ctx->program.fragment_program.texture_params[i].remap |= (remap_hi << 16u);
 				}
 			}
+
+#ifndef RPCS3_DISABLE_SCALED_RTT_PREFILTER
+			{
+				const u32 eff_dst_w = std::min<u32>(REGS(m_ctx)->surface_clip_width(), REGS(m_ctx)->scissor_width());
+				const u32 eff_dst_h = std::min<u32>(REGS(m_ctx)->surface_clip_height(), REGS(m_ctx)->scissor_height());
+				if (rsx::should_prefilter_scaled_rtt(
+					m_ctx->program.fp_metadata.multi_tap_textures_mask, i, sampler_descriptors[i].get(),
+					tex.alpha_kill_enabled(), tex.width(), tex.height(), eff_dst_w, eff_dst_h))
+				{
+					static const f32 s_prefilter_radius_override = []() -> f32 {
+						const char* env = std::getenv("RPCS3_PREFILTER_RADIUS");
+						return (env && env[0]) ? std::strtof(env, nullptr) : 0.f;
+					}();
+					static const bool s_log_prefilter = []() {
+						const char* env = std::getenv("RPCS3_LOG_PREFILTER_SHADERS");
+						return env && env[0] == '1';
+					}();
+
+					const f32 radius = (s_prefilter_radius_override > 0.f)
+						? s_prefilter_radius_override
+						: (0.25f * sampler_descriptors[i]->rtt_scale_factor);
+					texture_control |= (1u << rsx::texture_control_bits::SCALED_RTT_PREFILTER);
+					m_ctx->program.fragment_program.texture_params[i].scale[2] = radius;
+
+					if (s_log_prefilter)
+					{
+						static std::unordered_set<u64> s_logged_triggers;
+						const u32 fp_addr = m_ctx->program.fragment_program.offset;
+						const u64 key = (static_cast<u64>(fp_addr) << 16) | (static_cast<u64>(i) << 8) | m_ctx->program.fp_metadata.tex_tap_counts[i];
+						if (s_logged_triggers.insert(key).second)
+						{
+							rsx_log.notice("[SCALED_RTT_PREFILTER] fp=0x%08x slot=%u taps=%u tex=%ux%u fmt=0x%x minf=%u magf=%u rtt_scale=%.2f radius=%.3f clamp=%d clip=%ux%u scissor=%u,%u,%ux%u",
+								fp_addr, i, static_cast<u32>(m_ctx->program.fp_metadata.tex_tap_counts[i]),
+								tex.width(), tex.height(), format,
+								static_cast<u32>(tex.min_filter()), static_cast<u32>(tex.mag_filter()),
+								sampler_descriptors[i]->rtt_scale_factor, radius,
+								sampler_descriptors[i]->texcoord_xform.clamp ? 1 : 0,
+								REGS(m_ctx)->surface_clip_width(), REGS(m_ctx)->surface_clip_height(),
+								REGS(m_ctx)->scissor_origin_x(), REGS(m_ctx)->scissor_origin_y(),
+								REGS(m_ctx)->scissor_width(), REGS(m_ctx)->scissor_height());
+						}
+					}
+				}
+			}
+#endif
 
 			m_ctx->program.fragment_program.texture_params[i].control = texture_control;
 		}

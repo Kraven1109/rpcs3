@@ -153,6 +153,9 @@ namespace rsx
 			utils::address_range32 cache_range;
 			bool do_not_cache = false;
 			bool force_bg_load = false;
+#ifndef RPCS3_DISABLE_SPARSE_MIPMAP_GATHER_FIX
+			bool dirty_gpu_mips = false;
+#endif
 
 			using section_array_type = rsx::simple_array<copy_region_descriptor>;
 
@@ -338,7 +341,11 @@ namespace rsx
 				case rsx::deferred_request_command::cubemap_unwrap:
 					return static_cast<u8>(mipmaps);
 				case rsx::deferred_request_command::mipmap_gather:
+#ifndef RPCS3_DISABLE_SPARSE_MIPMAP_GATHER_FIX
+					return force_bg_load ? static_cast<u8>(mipmaps) : static_cast<u8>(sections_to_copy.size());
+#else
 					return static_cast<u8>(sections_to_copy.size());
+#endif
 				default:
 					break;
 				}
@@ -682,6 +689,12 @@ namespace rsx
 		atomic_t<u32> m_texture_upload_misses_this_frame = { 0 };
 		atomic_t<u32> m_texture_copies_ellided_this_frame = { 0 };
 		static const u32 m_predict_max_flushes_per_frame = 50; // Above this number the predictions are disabled
+
+#ifndef RPCS3_DISABLE_ATLAS_WAW_AND_PRUNE_FIX
+		// Negative-cache geometry signatures of overlapping FBO sets already verified duplicate-free
+		std::array<u64, 8> m_clean_dup_sigs{};
+		u32 m_clean_dup_sig_idx = 0;
+#endif
 
 		// Invalidation
 		static const bool invalidation_ignore_unsynchronized = true; // If true, unsynchronized sections don't get forcefully flushed unless they overlap the fault range
@@ -2390,8 +2403,17 @@ namespace rsx
 					if (It->second.first.encoded_properties() != desc_key)
 						continue;
 
-					if (desc.op == deferred_request_command::copy_image_dynamic)
+					if (desc.op == deferred_request_command::copy_image_dynamic
+#ifndef RPCS3_DISABLE_SPARSE_MIPMAP_GATHER_FIX
+						|| (desc.op == deferred_request_command::mipmap_gather && It->second.first.dirty_gpu_mips)
+#endif
+						)
+					{
 						update_image_contents(cmd, It->second.second, desc);
+#ifndef RPCS3_DISABLE_SPARSE_MIPMAP_GATHER_FIX
+						It->second.first.dirty_gpu_mips = false;
+#endif
+					}
 
 					if (It->second.first.remap.encoded != desc.remap.encoded)
 					{
@@ -2498,6 +2520,18 @@ namespace rsx
 				const auto& desc = It->second.first;
 				if (range.overlaps(desc.cache_range))
 				{
+#ifndef RPCS3_DISABLE_SPARSE_MIPMAP_GATHER_FIX
+					if (desc.op == deferred_request_command::mipmap_gather && desc.force_bg_load)
+					{
+						const auto mip0_range = utils::address_range32::start_length(desc.address, desc.pitch * desc.height);
+						if (!range.overlaps(mip0_range))
+						{
+							It->second.first.dirty_gpu_mips = true;
+							++It;
+							continue;
+						}
+					}
+#endif
 					release_temporary_subresource(It->second.second);
 					It = m_temporary_subresource_cache.erase(It);
 				}
@@ -2847,9 +2881,67 @@ namespace rsx
 					if (const auto coverage_ratio = (coverage_size * 100ull) / memory_range.length();
 						coverage_ratio > max_overdraw_ratio)
 					{
+#ifdef RPCS3_DISABLE_ATLAS_WAW_AND_PRUNE_FIX
 						rsx_log.warning("[Performance warning] Texture gather routine encountered too many objects! Operation=%d, Mipmaps=%d, Depth=%d, Sections=%zu, Ratio=%llu%",
 							static_cast<int>(result.external_subresource_desc.op), attr.mipmaps, attr.depth, overlapping_fbos.size(), coverage_ratio);
 						m_rtts.check_for_duplicates(overlapping_fbos);
+#else
+						// Fingerprint the exact surface geometry list; remove_duplicates_* is a pure function of it.
+						// Avoid re-running multi-MB fallback painter scans 500+/sec on legitimately dense overlapping pools (e.g. RE6).
+						u64 fbo_sig = (u64{ memory_range.start } << 32) | memory_range.length();
+						fbo_sig = (fbo_sig * 1315423911ull) ^ overlapping_fbos.size();
+						for (const auto& s : overlapping_fbos)
+						{
+							const auto r = s.surface->get_memory_range();
+							const u64 geom = (u64{ s.base_address } << 32) ^ (u64{ r.start } << 16) ^ r.end ^
+								(u64{ s.surface->template get_surface_width<rsx::surface_metrics::bytes>() } << 48) ^
+								(u64{ s.surface->get_rsx_pitch() } << 24) ^
+								s.surface->template get_surface_height<rsx::surface_metrics::samples>();
+							fbo_sig = (fbo_sig * 1315423911ull) ^ geom;
+						}
+						if (fbo_sig == 0) fbo_sig = 1;
+
+						bool already_clean = false;
+						for (const u64 cached_sig : m_clean_dup_sigs)
+						{
+							if (cached_sig == fbo_sig)
+							{
+								already_clean = true;
+								break;
+							}
+						}
+
+						if (!already_clean)
+						{
+							const usz prev_count = overlapping_fbos.size();
+							m_rtts.check_for_duplicates(overlapping_fbos);
+							overlapping_fbos.erase_if([&](const auto& s)
+							{
+								return m_rtts.get_surface_at(s.base_address) != s.surface;
+							});
+
+							if (overlapping_fbos.size() == prev_count)
+							{
+								m_clean_dup_sigs[m_clean_dup_sig_idx++ & 7u] = fbo_sig;
+							}
+							else
+							{
+								m_clean_dup_sigs.fill(0);
+								if (overlapping_fbos.empty() && overlapping_locals.empty())
+								{
+									return {};
+								}
+
+								result = helpers::merge_cache_resources<sampled_image_descriptor>(
+									cmd, overlapping_fbos, overlapping_locals, attr, scale, extended_dimension, remap, _pool);
+
+								if (result.external_subresource_desc.sections_to_copy.empty())
+								{
+									return {};
+								}
+							}
+						}
+#endif
 					}
 				}
 
@@ -3312,6 +3404,85 @@ namespace rsx
 					return result;
 				}
 			}
+
+#ifndef RPCS3_DISABLE_SPARSE_MIPMAP_GATHER_FIX
+			// When mip 0 misses surface/texture caches on a multi-mip 2D texture, sub-mips (1..N-1) may still be
+			// GPU-resident render targets (e.g. RE6 60-frame dynamic cubemap pyramid). Gather GPU sub-mips with
+			// background CPU initialization instead of forcing synchronous GPU->CPU DMA readbacks of the entire mipchain.
+			if (extended_dimension == rsx::texture_dimension_extended::texture_dimension_2d &&
+				subsurface_count > 1)
+			{
+				if (!tex_size)
+				{
+					tex_size = static_cast<u32>(get_texture_size(tex));
+				}
+
+				const u32 mip0_end = attributes.address + (attributes.pitch * attributes.height);
+				const u32 full_end = attributes.address + tex_size;
+				if (full_end > mip0_end &&
+					m_rtts.overlaps_surface_range(utils::address_range32::start_end(mip0_end, full_end - 1)))
+				{
+					rsx::simple_array<copy_region_descriptor> sections;
+					sections.reserve(subsurface_count);
+					auto to_surface_type = [](const copy_region_descriptor& rgn) -> typename surface_store_type::surface_type
+					{
+						return static_cast<typename surface_store_type::surface_type>(rgn.src);
+					};
+
+					auto attr2 = attributes;
+					auto sub_opts = options;
+					sub_opts.skip_texture_merge = true;
+					sub_opts.skip_texture_barriers = true;
+					sub_opts.prefer_surface_cache = true;
+					sub_opts.lookup_mask = rsx::texture_upload_context::blit_engine_dst;
+
+					bool any_bound = false;
+					for (u8 subsurface = 1; subsurface < subsurface_count; ++subsurface)
+					{
+						attr2.address += (attr2.pitch * attr2.height);
+						attr2.width = std::max<u16>(attr2.width / 2, 1);
+						attr2.height = std::max<u16>(attr2.height / 2, 1);
+						attr2.slice_h = attr2.height;
+
+						if (attributes.swizzled)
+						{
+							attr2.pitch = attr2.width * attr2.bpp;
+						}
+
+						const auto range = utils::address_range32::start_length(attr2.address, attr2.pitch * attr2.height);
+						auto ret = fast_texture_search(cmd, attr2, scale, tex.decoded_remap(),
+							sub_opts, range, extended_dimension, m_rtts, std::forward<Args>(extras)...);
+
+						if (ret.validate() &&
+							(ret.upload_context == rsx::texture_upload_context::framebuffer_storage ||
+							 ret.upload_context == rsx::texture_upload_context::blit_engine_dst))
+						{
+							if (helpers::append_mipmap_level(to_surface_type, sections, ret, attr2, subsurface, false, attributes))
+							{
+								any_bound |= m_rtts.address_is_bound(attr2.address);
+							}
+						}
+					}
+
+					if (!sections.empty())
+					{
+						sampled_image_descriptor sparse_result =
+						{
+							deferred_subresource::create_mipmap_gather(attributes, std::move(sections), tex.decoded_remap(), true),
+							rsx::texture_upload_context::framebuffer_storage,
+							rsx::classify_format(attributes.gcm_format),
+							scale,
+							extended_dimension,
+							attributes.address
+						};
+						sparse_result.surface_cache_tag = m_rtts.write_tag;
+						sparse_result.external_subresource_desc.cache_range = utils::address_range32::start_length(attributes.address, tex_size);
+						sparse_result.external_subresource_desc.do_not_cache = any_bound;
+						return sparse_result;
+					}
+				}
+			}
+#endif
 
 			// Do direct upload from CPU as the last resort
 			m_texture_upload_misses_this_frame++;

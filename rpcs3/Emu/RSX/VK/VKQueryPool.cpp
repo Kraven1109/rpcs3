@@ -5,7 +5,18 @@
 #include "VKRenderPass.h"
 #include "VKResourceManager.h"
 #include "util/asm.hpp"
+#include "util/sysinfo.hpp"
+#include "Utilities/Thread.h"
+#include "Emu/system_config.h"
 #include "VKGSRender.h"
+
+#if defined(ARCH_X64)
+#ifdef _MSC_VER
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
+#endif
 
 namespace vk
 {
@@ -171,6 +182,18 @@ namespace vk
 		return poke_query(query_slot_status[index], index, result_flags);
 	}
 
+#if defined(ARCH_X64) && !defined(RPCS3_DISABLE_RSX_VK_ADAPTIVE_WAIT_OPT)
+#if defined(_MSC_VER)
+	static inline void vk_qp_tpause_c02(u64 deadline)
+#else
+	__attribute__((target("waitpkg")))
+	static inline void vk_qp_tpause_c02(u64 deadline)
+#endif
+	{
+		_tpause(0, deadline);
+	}
+#endif
+
 	u32 query_pool_manager::get_query_result(u32 index)
 	{
 		// Check for cached result
@@ -180,11 +203,46 @@ namespace vk
 		{
 			poke_query(query_info, index, result_flags);
 
+#ifndef RPCS3_DISABLE_RSX_VK_ADAPTIVE_WAIT_OPT
+			u32 spin_count = 0;
+#if defined(ARCH_X64)
+			static const bool s_has_waitpkg = utils::has_waitpkg();
+			const u64 cycles_per_us = utils::get_tsc_freq() / 1'000'000;
+#endif
+			while (!query_info.ready)
+			{
+				if (spin_count >= 96 &&
+					!g_cfg.core.spu_reservation_busy_waiting_enabled &&
+					g_cfg.video.frame_limit != frame_limit_type::infinite &&
+					g_cfg.video.frame_limit != frame_limit_type::none)
+				{
+					thread_ctrl::wait_for(50, false);
+				}
+#if defined(ARCH_X64)
+				else if (s_has_waitpkg && cycles_per_us && spin_count >= 16)
+				{
+					const u64 step_us = (spin_count < 48) ? 2ull : 5ull;
+					vk_qp_tpause_c02(utils::get_tsc() + step_us * cycles_per_us);
+				}
+#endif
+				else
+				{
+					utils::pause();
+				}
+
+				if (spin_count < 96)
+				{
+					++spin_count;
+				}
+				poke_query(query_info, index, result_flags);
+			}
+#else
 			while (!query_info.ready)
 			{
 				utils::pause();
 				poke_query(query_info, index, result_flags);
 			}
+#endif
 		}
 
 		return query_info.data;
