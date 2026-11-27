@@ -1066,6 +1066,30 @@ void VKGSRender::on_invalidate_memory_range(rsx::context* ctx, const utils::addr
 	}
 }
 
+#ifndef RPCS3_DISABLE_SAVESTATE_SURFACE_FLUSH
+void VKGSRender::on_flush_guest_data(rsx::context* ctx)
+{
+	const auto resources = res(ctx);
+	if (!resources)
+	{
+		return;
+	}
+
+	// Submit any pending primary CB draws/layout transitions before DMA readback on the secondary CB.
+	if (m_current_command_buffer && m_current_command_buffer->is_recording())
+	{
+		flush_command_queue();
+	}
+
+	{
+		std::lock_guard lock(m_secondary_cb_guard);
+		resources->texture_cache.flush_all_guest_data(*m_secondary_cb_list.next(), resources->surface_cache);
+	}
+
+	rsx::mm_flush();
+}
+#endif
+
 void VKGSRender::on_unmap_memory_range(const utils::address_range32& range)
 {
 	std::lock_guard lock(m_secondary_cb_guard);

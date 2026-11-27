@@ -117,6 +117,12 @@ namespace rsx
 		// Memory. Handled per-context.
 		virtual bool on_access_violation(context* /*ctx*/, u32 /*address*/, bool /*is_writing*/) { return false; }
 		virtual void on_invalidate_memory_range(context* /*ctx*/, const utils::address_range32& /*range*/, invalidation_cause /*cause*/) {}
+#ifndef RPCS3_DISABLE_SAVESTATE_SURFACE_FLUSH
+		virtual void on_flush_guest_data(context* ctx)
+		{
+			on_invalidate_memory_range(ctx, utils::address_range32::start_end(0, umax), invalidation_cause::read);
+		}
+#endif
 		virtual void on_unmap_memory_range(const utils::address_range32& /*range*/) {}
 
 		virtual void notify_tile_unbound(u32 /*tile*/) {}

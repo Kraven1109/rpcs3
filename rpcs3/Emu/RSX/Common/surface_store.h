@@ -1667,6 +1667,61 @@ namespace rsx
 			process_list_function(m_depth_stencil_storage, m_depth_stencil_memory_range);
 		}
 
+#ifndef RPCS3_DISABLE_SAVESTATE_SURFACE_FLUSH
+		std::vector<surface_type> collect_flushable_surfaces()
+		{
+			std::vector<surface_type> result;
+
+			auto collect_list = [&](surface_ranged_map& data, const utils::address_range32& range)
+			{
+				if (!range.valid())
+				{
+					return;
+				}
+
+				for (auto it = data.begin_range(range); it != data.end(); ++it)
+				{
+					auto surface = Traits::get(it->second);
+					if (!surface || !surface->base_addr || !surface->get_rsx_pitch())
+					{
+						continue;
+					}
+
+					if (!surface->template get_surface_width<rsx::surface_metrics::pixels>() ||
+						!surface->template get_surface_height<rsx::surface_metrics::pixels>())
+					{
+						continue;
+					}
+
+					// Skip uninitialized surfaces waiting for CPU load or surfaces already overwritten by CPU.
+					if (surface->write_through() || !surface->test())
+					{
+						continue;
+					}
+
+					const auto mem_range = surface->get_memory_range();
+					if (!mem_range.valid() || !vm::check_addr(mem_range.start, 0, mem_range.length()))
+					{
+						continue;
+					}
+
+					result.push_back(surface);
+				}
+			};
+
+			collect_list(m_render_targets_storage, m_render_targets_memory_range);
+			collect_list(m_depth_stencil_storage, m_depth_stencil_memory_range);
+
+			if (result.size() > 1)
+			{
+				// Sort oldest first so newer overlapping surfaces supersede older ones during writeback.
+				std::sort(result.begin(), result.end(), FN(x->last_use_tag < y->last_use_tag));
+			}
+
+			return result;
+		}
+#endif
+
 		virtual bool handle_memory_pressure(command_list_type cmd, problem_severity severity)
 		{
 			ensure(severity >= rsx::problem_severity::moderate);

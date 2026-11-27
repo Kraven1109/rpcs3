@@ -1311,6 +1311,21 @@ void GLGSRender::on_invalidate_memory_range(rsx::context* ctx, const utils::addr
 	}
 }
 
+#ifndef RPCS3_DISABLE_SAVESTATE_SURFACE_FLUSH
+void GLGSRender::on_flush_guest_data(rsx::context* ctx)
+{
+	const auto resources = res(ctx);
+	if (!resources)
+	{
+		return;
+	}
+
+	gl::command_context cmd{ gl_state };
+	resources->texture_cache.flush_all_guest_data(cmd, resources->surface_cache);
+	rsx::mm_flush();
+}
+#endif
+
 void GLGSRender::on_semaphore_acquire_wait()
 {
 	if (!work_queue.empty() ||
