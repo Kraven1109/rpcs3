@@ -66,6 +66,13 @@ bool uncompressed_serialization_file_handler::handle_file_op(utils::serial& ar, 
 		// Discard loaded data until pos if profitable
 		const usz limit = ar.data_offset + ar.data.size();
 
+#ifndef RPCS3_DISABLE_SAVESTATE_ZSTD_DISCARD_FIX
+		if (ar.pos == ar.data_offset)
+		{
+			return true;
+		}
+#endif
+
 		if (ar.pos > ar.data_offset && ar.pos < limit)
 		{
 			const usz may_discard_bytes = ar.pos - ar.data_offset;
@@ -358,6 +365,13 @@ bool compressed_serialization_file_handler::handle_file_op(utils::serial& ar, us
 	{
 		// Discard loaded data until pos if profitable
 		const usz limit = ar.data_offset + ar.data.size();
+
+#ifndef RPCS3_DISABLE_SAVESTATE_ZSTD_DISCARD_FIX
+		if (ar.pos == ar.data_offset)
+		{
+			return true;
+		}
+#endif
 
 		if (ar.pos > ar.data_offset && ar.pos < limit)
 		{
@@ -915,6 +929,13 @@ bool compressed_zstd_serialization_file_handler::handle_file_op(utils::serial& a
 	{
 		// Discard loaded data until pos if profitable
 		const usz limit = ar.data_offset + ar.data.size();
+
+#ifndef RPCS3_DISABLE_SAVESTATE_ZSTD_DISCARD_FIX
+		if (ar.pos == ar.data_offset)
+		{
+			return true;
+		}
+#endif
 
 		if (ar.pos > ar.data_offset && ar.pos < limit)
 		{
