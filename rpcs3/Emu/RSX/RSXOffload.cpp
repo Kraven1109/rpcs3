@@ -18,9 +18,21 @@ namespace rsx
 		lf_queue<transport_packet> m_work_queue;
 		atomic_t<u64> m_enqueued_count = 0;
 		atomic_t<u64> m_processed_count = 0;
+		atomic_t<bool> m_sleeping = false;
 		transport_packet* m_current_job = nullptr;
 
 		thread_base* current_thread_ = nullptr;
+
+		template <typename... Args>
+		void enqueue(Args&&... args)
+		{
+			m_enqueued_count++;
+			m_work_queue.push(std::forward<Args>(args)...);
+			if (m_sleeping.load())
+			{
+				m_enqueued_count.notify_one();
+			}
+		}
 
 		void operator ()()
 		{
@@ -40,8 +52,10 @@ namespace rsx
 
 			while (thread_ctrl::state() != thread_state::aborting)
 			{
+				bool did_work = false;
 				for (auto&& job : m_work_queue.pop_all())
 				{
+					did_work = true;
 					m_current_job = &job;
 
 					switch (job.type)
@@ -76,10 +90,37 @@ namespace rsx
 
 				m_current_job = nullptr;
 
-				if (m_enqueued_count.load() == m_processed_count.load())
+				if (did_work)
 				{
 					m_processed_count.notify_all();
-					std::this_thread::yield();
+				}
+
+				const u64 processed = m_processed_count.load();
+				if (m_enqueued_count.load() == processed)
+				{
+					for (u32 spin = 0; spin < 16; ++spin)
+					{
+						if (m_enqueued_count.load() != processed)
+						{
+							break;
+						}
+						utils::pause();
+					}
+
+					if (m_enqueued_count.load() == processed)
+					{
+						utils::spin_on_cacheline_once(m_enqueued_count, processed, 5);
+					}
+
+					if (m_enqueued_count.load() == processed)
+					{
+						m_sleeping.exchange(true);
+						if (m_enqueued_count.load() == processed)
+						{
+							m_enqueued_count.wait(processed, atomic_wait_timeout{100'000});
+						}
+						m_sleeping.release(false);
+					}
 				}
 			}
 
@@ -105,8 +146,7 @@ namespace rsx
 		}
 		else
 		{
-			m_thread->m_enqueued_count++;
-			m_thread->m_work_queue.push(dst, src, length);
+			m_thread->enqueue(dst, src, length);
 		}
 	}
 
@@ -120,8 +160,7 @@ namespace rsx
 		}
 		else
 		{
-			m_thread->m_enqueued_count++;
-			m_thread->m_work_queue.push(dst, src, length);
+			m_thread->enqueue(dst, src, length);
 		}
 	}
 
@@ -135,8 +174,7 @@ namespace rsx
 		}
 		else
 		{
-			m_thread->m_enqueued_count++;
-			m_thread->m_work_queue.push(dst, primitive, count);
+			m_thread->enqueue(dst, primitive, count);
 		}
 	}
 
@@ -145,8 +183,7 @@ namespace rsx
 	{
 		ensure(g_cfg.video.multithreaded_rsx);
 
-		m_thread->m_enqueued_count++;
-		m_thread->m_work_queue.push(request_code, args);
+		m_thread->enqueue(request_code, args);
 	}
 
 	// Synchronization
@@ -178,16 +215,31 @@ namespace rsx
 				return false;
 			}
 
-			while (_thr.m_enqueued_count.load() > _thr.m_processed_count.load())
+			while (true)
 			{
+				const u64 processed = _thr.m_processed_count.load();
+				if (_thr.m_enqueued_count.load() <= processed)
+				{
+					break;
+				}
 				rsxthr->renderer()->on_semaphore_acquire_wait();
-				utils::pause();
+				if (_thr.m_processed_count.load() == processed)
+				{
+					utils::spin_on_cacheline_once(_thr.m_processed_count, processed, 1);
+				}
 			}
 		}
 		else
 		{
-			while (_thr.m_enqueued_count.load() > _thr.m_processed_count.load())
-				utils::pause();
+			while (true)
+			{
+				const u64 processed = _thr.m_processed_count.load();
+				if (_thr.m_enqueued_count.load() <= processed)
+				{
+					break;
+				}
+				utils::spin_on_cacheline_once(_thr.m_processed_count, processed, 1);
+			}
 		}
 
 		return true;
@@ -197,6 +249,7 @@ namespace rsx
 	{
 		sync();
 		*m_thread = thread_state::aborting;
+		m_thread->m_enqueued_count.notify_all();
 	}
 
 	void dma_manager::set_mem_fault_flag()
