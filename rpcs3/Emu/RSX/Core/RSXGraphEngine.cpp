@@ -564,6 +564,23 @@ namespace rsx
 			{
 				layout.zeta_address += (layout.actual_zeta_pitch * window_offset_y) + (depth_texel_size * window_offset_x);
 			}
+
+#ifndef RPCS3_DISABLE_WINDOW_OFFSET_CLIP_FIX
+			// When a title sets both surface clip origin and window offset to the same sub-region
+			// start (e.g. MT Framework / RE6 mip-pyramid FBOs: clip_origin_y == window_offset_y with
+			// clip_height encoding y_end = origin_y + h), rebase layout dimensions to (end - offset)
+			// so the surface does not bleed past its real bounds and stall/alias adjacent textures.
+			const u16 clip_origin_x = REGS(m_ctx)->surface_clip_origin_x();
+			const u16 clip_origin_y = REGS(m_ctx)->surface_clip_origin_y();
+			if (window_offset_x && clip_origin_x == window_offset_x && layout.width > window_offset_x)
+			{
+				layout.width -= window_offset_x;
+			}
+			if (window_offset_y && clip_origin_y == window_offset_y && layout.height > window_offset_y)
+			{
+				layout.height -= window_offset_y;
+			}
+#endif
 		}
 
 		if ((window_clip_width && window_clip_width < layout.width) ||
