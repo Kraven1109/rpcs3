@@ -360,6 +360,12 @@ enum class output_scaling_mode
 	fsr
 };
 
+enum class scaled_rtt_prefilter_mode
+{
+	off,
+	_auto
+};
+
 enum class stereo_render_mode_options
 {
 	disabled,

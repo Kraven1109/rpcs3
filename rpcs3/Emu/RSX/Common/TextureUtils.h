@@ -2,6 +2,7 @@
 
 #include "io_buffer.h"
 #include "simple_array.hpp"
+#include "Emu/system_config.h"
 #include "../Utils/color_utils.hpp"
 #include "../RSXTexture.h"
 
@@ -249,7 +250,7 @@ namespace rsx
 			const char* env = std::getenv("RPCS3_NO_PREFILTER");
 			return env && env[0] == '1';
 		}();
-		if (s_prefilter_disabled || !desc)
+		if (g_cfg.video.scaled_rtt_prefilter != scaled_rtt_prefilter_mode::_auto || s_prefilter_disabled || !desc)
 		{
 			return false;
 		}
