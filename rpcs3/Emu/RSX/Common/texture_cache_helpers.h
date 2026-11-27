@@ -685,11 +685,21 @@ namespace rsx
 				}
 			}
 
+#ifndef RPCS3_DISABLE_SCALED_RTT_PREFILTER
+			f32 rtt_scale = 1.f;
+#endif
 			if (texptr->resolution_scaling_config.scale_percent != 100)
 			{
 				const auto [scaled_w, scaled_h] = rsx::apply_resolution_scale<true>(texptr->resolution_scaling_config, attr.width, attr.height, surface_width, surface_height);
 				const auto [unused, scaled_slice_h] = rsx::apply_resolution_scale<false>(texptr->resolution_scaling_config, RSX_SURFACE_DIMENSION_IGNORED, attr.slice_h, surface_width, surface_height);
 				const auto [scaled_off_x, scaled_off_y] = rsx::apply_resolution_scale<false>(texptr->resolution_scaling_config, static_cast<u16>(scaled_offset.x), static_cast<u16>(scaled_offset.y), surface_width, surface_height);
+#ifndef RPCS3_DISABLE_SCALED_RTT_PREFILTER
+				if (texptr->resolution_scaling_config.scale_percent > 100 &&
+					std::max(surface_width, surface_height) > texptr->resolution_scaling_config.min_scalable_dimension)
+				{
+					rtt_scale = texptr->resolution_scaling_config.scale_factor();
+				}
+#endif
 				attr2.width = scaled_w;
 				attr2.height = scaled_h;
 				attr2.slice_h = scaled_slice_h;
@@ -770,7 +780,7 @@ namespace rsx
 					const coord3u src_rect = { scaled_offset.x, scaled_offset.y, 0, attr2.width, attr2.height, 1 };
 
 					texptr->memory_barrier(cmd, rsx::surface_access::transfer_read);
-					return
+					sampled_image_descriptor copy_result =
 					{
 						deferred_subresource_type::create_copy(
 							texptr->get_surface(rsx::surface_access::transfer_read),
@@ -779,6 +789,10 @@ namespace rsx
 						format_class, scale, extended_dimension,
 						texptr->base_addr
 					};
+#ifndef RPCS3_DISABLE_SCALED_RTT_PREFILTER
+					copy_result.rtt_scale_factor = rtt_scale;
+#endif
+					return copy_result;
 				}
 
 				texptr->memory_barrier(cmd, access_type);
@@ -794,6 +808,9 @@ namespace rsx
 					surface_is_rop_target,
 					viewed_surface->samples()
 				};
+#ifndef RPCS3_DISABLE_SCALED_RTT_PREFILTER
+				result.rtt_scale_factor = rtt_scale;
+#endif
 
 				if (requires_clip)
 				{
@@ -955,6 +972,12 @@ namespace rsx
 				rsx::texture_dimension_extended::texture_dimension_2d,
 				attr.address
 			};
+#ifndef RPCS3_DISABLE_SCALED_RTT_PREFILTER
+			if (!fbos.empty() && scaling_config.scale_percent > 100 && scaled_w > attr.width)
+			{
+				result.rtt_scale_factor = scaling_config.scale_factor();
+			}
+#endif
 
 			result.simplify();
 			return result;

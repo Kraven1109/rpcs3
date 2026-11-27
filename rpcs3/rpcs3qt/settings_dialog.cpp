@@ -574,6 +574,7 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 	SubscribeTooltip(ui->gbZCULL, tooltips.settings.zcull_operation_mode);
 
 	EnhanceComboBox(emu_settings_type::OutputScalingMode, ui->outputScalingMode, tooltips.settings.output_scaling_mode);
+	EnhanceComboBox(emu_settings_type::ScaledRTTPrefilter, ui->scaledRTTPrefilterMode, tooltips.settings.scaled_rtt_prefilter, ui->gb_scaledRTTPrefilter);
 
 	// VR headset
 	EnhanceComboBox(emu_settings_type::OpenXRRenderMode, ui->openxrRenderMode, tooltips.settings.openxr_render_mode, ui->gb_openxr_render_mode);
@@ -625,6 +626,7 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 	{
 		ui->gb_resolutionScale->setEnabled(!checked);
 		ui->gb_minimumScalableDimension->setEnabled(!checked);
+		ui->gb_scaledRTTPrefilter->setEnabled(!checked);
 		ui->gb_anisotropicFilter->setEnabled(!checked);
 		ui->vulkansched->setEnabled(!checked);
 	};
