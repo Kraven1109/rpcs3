@@ -1121,6 +1121,13 @@ QString emu_settings::GetLocalizedSetting(const QString& original, emu_settings_
 		case output_scaling_mode::fsr: return tr("FidelityFX Super Resolution 1", "Output Scaling Mode");
 		}
 		break;
+	case emu_settings_type::ScaledRTTPrefilter:
+		switch (static_cast<scaled_rtt_prefilter_mode>(index))
+		{
+		case scaled_rtt_prefilter_mode::off: return tr("Off", "Scaled RTT Blur Prefilter");
+		case scaled_rtt_prefilter_mode::_auto: return tr("Auto", "Scaled RTT Blur Prefilter");
+		}
+		break;
 	case emu_settings_type::AudioRenderer:
 		switch (static_cast<audio_renderer>(index))
 		{

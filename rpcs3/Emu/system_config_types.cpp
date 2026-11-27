@@ -742,6 +742,21 @@ void fmt_class_string<output_scaling_mode>::format(std::string& out, u64 arg)
 }
 
 template <>
+void fmt_class_string<scaled_rtt_prefilter_mode>::format(std::string& out, u64 arg)
+{
+	format_enum(out, arg, [](scaled_rtt_prefilter_mode value)
+	{
+		switch (value)
+		{
+		case scaled_rtt_prefilter_mode::off: return "Off";
+		case scaled_rtt_prefilter_mode::_auto: return "Auto";
+		}
+
+		return unknown;
+	});
+}
+
+template <>
 void fmt_class_string<xfloat_accuracy>::format(std::string& out, u64 arg)
 {
 	format_enum(out, arg, [](xfloat_accuracy value)
