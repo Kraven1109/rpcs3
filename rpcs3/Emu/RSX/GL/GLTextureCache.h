@@ -690,7 +690,7 @@ namespace gl
 
 		gl::texture_view* generate_2d_mipmaps_from_images(gl::command_context& cmd, const deferred_subresource& desc) override
 		{
-			const auto mipmaps = ::narrow<u8>(desc.sections_to_copy.size());
+			const auto mipmaps = desc.exact_mip_count();
 			auto _template = get_template_from_collection_impl(desc.sections_to_copy);
 			auto result = create_temporary_subresource_impl(cmd, _template, GL_NONE, GL_TEXTURE_2D, desc.gcm_format, desc.width, desc.height, 1, mipmaps, desc.remap);
 

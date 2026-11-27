@@ -938,7 +938,7 @@ namespace vk
 	vk::image_view* texture_cache::generate_2d_mipmaps_from_images(vk::command_buffer& cmd, const deferred_subresource& desc)
 	{
 		const auto& sections_to_copy = desc.sections_to_copy;
-		const auto mipmaps = ::narrow<u8>(sections_to_copy.size());
+		const auto mipmaps = desc.exact_mip_count();
 		auto _template = get_template_from_collection_impl(sections_to_copy);
 		auto result = create_temporary_subresource_view_impl(cmd, _template, VK_IMAGE_TYPE_2D,
 			VK_IMAGE_VIEW_TYPE_2D, desc.gcm_format, desc.width, desc.height, 1, mipmaps, desc.remap);
@@ -998,8 +998,10 @@ namespace vk
 	{
 		const auto subresources_layout = rsx::get_subresources_layout(desc, type);
 		const u16 layer_count = (type == rsx::texture_dimension_extended::texture_dimension_cubemap) ? 6 : 1;
+		// Use layout-derived per-mip pitch (upload_heap_align_default) rather than base desc.pitch so multi-mip
+		// linear subresources do not miscompute staging upload pitch / bufferRowLength on sub-mips.
 		vk::upload_image(cmd, dst, subresources_layout, desc.gcm_format, desc.swizzled, layer_count,
-			dst->aspect(), *vk::get_upload_heap(), desc.pitch, vk::upload_contents_inline);
+			dst->aspect(), *vk::get_upload_heap(), vk::upload_heap_align_default, vk::upload_contents_inline);
 	}
 
 	void texture_cache::update_image_contents(vk::command_buffer& cmd, vk::image_view* dst_view, const deferred_subresource& desc)
