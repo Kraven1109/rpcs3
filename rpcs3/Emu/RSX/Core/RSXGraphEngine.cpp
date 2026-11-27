@@ -558,6 +558,19 @@ namespace rsx
 			{
 				layout.zeta_address += (layout.actual_zeta_pitch * window_offset_y) + (depth_texel_size * window_offset_x);
 			}
+
+			// Rebase surface dimensions when clip origin matches window offset (e.g. sub-region mip-pyramid FBOs
+			// where clip width/height encode end coordinates rather than relative extent).
+			const u16 clip_origin_x = REGS(m_ctx)->surface_clip_origin_x();
+			const u16 clip_origin_y = REGS(m_ctx)->surface_clip_origin_y();
+			if (window_offset_x && clip_origin_x == window_offset_x && layout.width > window_offset_x)
+			{
+				layout.width -= window_offset_x;
+			}
+			if (window_offset_y && clip_origin_y == window_offset_y && layout.height > window_offset_y)
+			{
+				layout.height -= window_offset_y;
+			}
 		}
 
 		if ((window_clip_width && window_clip_width < layout.width) ||
